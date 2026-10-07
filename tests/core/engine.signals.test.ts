@@ -329,6 +329,9 @@ describe("fail-fast cancellation and collateral (设计 §7.1/§7.4)", () => {
 		expect(nodeError.collateral).toEqual(["a#1"]);
 		expect(ofType(events, "node_failed").map((e) => e.node)).toEqual(["b"]);
 		expect(aRuns.count).toBe(1);
+		// T5 分类不改变 R20a：ECONNRESET 是 D3 可重试族，但被取消的实例**永不**重试
+		// （取消判定先于分类）——没有幻觉 node_retry、也没有第二次尝试
+		expect(ofType(events, "node_retry")).toHaveLength(0);
 	});
 
 	it("classifies a shape-invalid fulfilment of a cancelled instance as collateral, not as root (R20a)", async () => {
@@ -744,7 +747,9 @@ describe("retry with backoff (设计 §7.2)", () => {
 				configuredFn({
 					maxAttempts: 8,
 					handler: () => {
-						throw new Error("transient");
+						// D3 可重试族（5xx 数字状态码，数字边界）——Task 5 收紧分类后
+						// 仍是可重试失败，退避序列才有意义
+						throw new Error("transient 503");
 					},
 				}),
 			)
@@ -810,7 +815,8 @@ describe("retry with backoff (设计 §7.2)", () => {
 					maxAttempts: 3,
 					handler: () => {
 						runs += 1;
-						throw new Error("transient");
+						// D3 可重试族（5xx）——首个失败必须进入退避，取消窗口才成立
+						throw new Error("transient 503");
 					},
 				}),
 			)
@@ -968,7 +974,8 @@ describe("attempt timeouts (设计 §7.3/§7.4)", () => {
 					handler: () => {
 						runs += 1;
 						if (runs === 1) {
-							throw new Error("transient");
+							// D3 可重试族（5xx）——否则不可重试路径直接失败，重试根本不发生
+							throw new Error("transient 503");
 						}
 						return { v: runs };
 					},

@@ -28,10 +28,13 @@
  * - run 取消/超时优先于实例失败：本超步整体不提交（`superstep_aborted`），run 以
  *   `WorkflowError("run cancelled" / "run timed out after Xms")` 拒绝——不包 NodeExecutionError。
  *
- * 重试（T11，§7.2）：`retry.maxAttempts` 是**总尝试次数**（含首次，默认 1 = 不重试）。
- * 非取消失败后按 full jitter 退避 `min(500 * 2^已重试次数 * random(), 30_000)`（注入的
- * sleep/random，时序可测），每次重试前发 `node_retry`（attempt = 刚失败的那次尝试编号）。
- * 取消类失败（实例信号已 abort 时到达的**任何**失败，与错误形状/类型无关，R20a）**不重试**。
+ * 重试（T11，§7.2；T5 落地分类，D3）：`retry.maxAttempts` 是**总尝试次数**（含首次，
+ * 默认 1 = 不重试）。只有**分类为可重试**的失败（`isRetryableError`：429/408/5xx 消息族、
+ * timeout/"timed out"、ECONNRESET、socket hang up，或 `markRetryable` 标记）才按 full jitter
+ * 退避 `min(500 * 2^已重试次数 * random(), 30_000)`（注入的 sleep/random，时序可测），每次
+ * 重试前发 `node_retry`（attempt = 刚失败的那次尝试编号）；不可重试的失败**立即失败**
+ * （不退避、不发 node_retry）。取消类失败（实例信号已 abort 时到达的**任何**失败，
+ * 与错误形状/类型无关，R20a）**不重试**。
  *
  * 超时（T11，§7.3）：只有节点显式配置 `timeoutMs` 才有单次尝试超时（fn 无默认超时；
  * llm/agent 的 120s/600s 默认值 M2 由节点工厂落进该字段）。到期 abort attempt signal，
@@ -113,6 +116,7 @@ import {
 	WorkflowError,
 } from "./errors.js";
 import { redactEvent } from "./redact.js";
+import { isRetryableError } from "./retry.js";
 import { Send } from "./send.js";
 import {
 	type ChannelUpdate,
@@ -1073,13 +1077,17 @@ async function executeInstance<S extends object>(args: {
 		if (instanceSignal.aborted) {
 			throw new InstanceCancelledError(instance.instanceId);
 		}
-		if (attempt >= maxAttempts) {
-			// 重试耗尽 = 实例失败（根因取最后一次尝试的错误）
+		// 重试分类（§7.2 落地/D3，Task 5）：**不可重试**的失败（普通业务错误）立即失败——
+		// 不退避、不发 node_retry；只有分类为可重试（瞬态：429/408/5xx/timeout/ECONNRESET/
+		// socket hang up，或 markRetryable 标记）才走下面的重试路径。`maxAttempts` 仍是总
+		// 尝试次数上限：可重试错误在第 maxAttempts 次尝试后同样在这里失败（根因取最后一次
+		// 尝试的错误）。分类是同步纯函数，不引入新的 await 窗口。
+		if (!isRetryableError(cause) || attempt >= maxAttempts) {
 			fail(cause);
 		}
 
 		// 重试（§7.2）：发 node_retry（attempt = 刚失败的那次尝试编号），退避后进入下一次尝试。
-		// 上一行的取消判定与这里之间没有 await：node_retry 永远对应一次**真会发生的**重试，
+		// 上面的取消判定与这里之间没有 await：node_retry 永远对应一次**真会发生的**重试，
 		// 不会出现"发了重试事件却被取消"的幻觉条目（R20a 的回归点）。
 		emitter.emit({
 			type: "node_retry",

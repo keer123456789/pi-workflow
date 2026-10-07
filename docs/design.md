@@ -434,7 +434,7 @@ for step in 0..:
 - 分类标准沿用 forge 的正则族：429 / 408 / 5xx / rate limit / timeout / ECONNRESET / socket hang up；llm 输出不符合 schema 同样可重试（同 prompt 重发）；
 - `retry.maxAttempts`：**总尝试次数**（含首次），默认 1（不重试）；
 - 退避：指数 base 500ms，上限 30s，full jitter（`sleep(min(base * 2^已重试次数 * random(), 30s))`，**指数用已重试次数，0 起**——首次重试的基数即 base 500ms；上限截断）；`clock` / `sleep` / `random` 均可注入（§4.6），重试时序可测试；
-- （分类落地于 M2：正则族 + 可重试标记，不可重试错误立即失败）
+- （分类落地于 M2（D3）：判定 = 内部可重试标记（`markRetryable()`，非枚举 Symbol；llm 的 schema/JSON 失败用它）或消息正则 `/(?:^|\D)(?:429|408|5\d\d)(?:\D|$)|rate[ -]?limit|too many requests|timeout|timed out|ECONNRESET|socket hang ?up/i`，或 `error.code === "ECONNRESET"`；**不可重试错误立即失败**——不退避、不发 `node_retry`，`maxAttempts` 仍是总尝试次数上限。引擎自身 attempt 超时消息含 "timed out" → 天然可重试）
 
 ### 7.3 超时
 
