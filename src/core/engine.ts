@@ -60,6 +60,18 @@
  * 实例）；Send 实例不去重，input 即 Send 载荷（§5.3）。router 每节点每超步求值一次，
  * 读提交后的合并 state 与该节点本超步自身写入的 fold（§4.2）。
  *
+ * run 日志接线（Task 3，D2/D7/D8，设计 §8）：
+ * - **默认开启**：`services.logger !== undefined` → 原样使用（`{}` = 全静默）；否则每次 run
+ *   用内置 JSONL 实现，目录 = `options.logDir ?? PI_WORKFLOW_LOG_DIR ?? ".pi-workflow/runs"`
+ *   （env 覆盖**每次 run**解析）；
+ * - **双路分发**（D7）：emitter 的 `transform` 做一次 hash 脱敏（`logOutputs: "hash"` 时），
+ *   onEvent 与 logger 拿同一个事件对象；
+ * - **失败策略**（D8）：`onLogError: "fail"`（默认）下任一 logger 钩子抛错 → 记录首个错误、
+ *   **立即中止 run signal**（审计优先），由既有失败出口（`superstep_aborted` +
+ *   `run_finished{failed}`）收尾并以 `WorkflowError("run log write failed: …")` 拒绝
+ *   （`cause` 附 logger 原错）；`"warn"` 只 `console.warn` 并继续。预检失败
+ *   （初始 state 校验 / 已 abort 的 signal）的 run 不碰 logger——连目录都不建。
+ *
  * 预算护栏与 I/O 并发（T12，§5.1:325-327/§5.3/§4.4）：检查点在**生成下一批之后、执行
  * 之前**（循环顶部，pending 已含本超步要跑的全部实例）——
  * - `maxInstancesPerSuperstep`（默认 1000）：`pending.length > limit` → 抛
@@ -75,7 +87,7 @@
  * 被 fail-fast/run 取消 abort 后永不执行——executeInstance 入口守卫直接归为
  * InstanceCancelledError（记进 collateral）。并发是 **I/O 并发**（§10 的并发模型说明）：
  * CPU 密集的 fn 节点会阻塞事件循环，这个上限对它无效。
- * 仍不含：JSONL 落盘（log/runlog.ts）。
+ * 仍不含：JSONL 落盘的实现本身（log/runlog.ts，Task 2 已落地）。
  *
  * 两个计数器互不相干（R2），都在 run 内全局单调：
  * - `instanceSeq`：NodeDefinition 的激活序 —— instanceId = `${name}#${seq}`，也是合并顺序（§5.2）；
@@ -85,6 +97,7 @@
 import { Value } from "typebox/value";
 
 import { createEmitter, type RunEmitter } from "../log/emitter.js";
+import { createJsonlLogger, type RunLogger } from "../log/runlog.js";
 import {
 	GraphRecursionError,
 	GraphValidationError,
@@ -94,6 +107,7 @@ import {
 	RouterError,
 	WorkflowError,
 } from "./errors.js";
+import { redactEvent } from "./redact.js";
 import { Send } from "./send.js";
 import {
 	type ChannelUpdate,
@@ -109,6 +123,7 @@ import {
 	type ResolvedServices,
 	type Router,
 	type RouterResult,
+	type RunEvent,
 	type RunHandle,
 	type RunOptions,
 	type RunResult,
@@ -128,6 +143,18 @@ const DEFAULT_MAX_INSTANCES_PER_SUPERSTEP = 1000;
 const DEFAULT_MAX_TOTAL_INSTANCES = 10_000;
 /** 同超步 I/O 并发上限的默认值（§4.4/§5.1:327）：8。 */
 const DEFAULT_MAX_CONCURRENCY = 8;
+
+/**
+ * 默认日志目录（D2）：`options.logDir ?? PI_WORKFLOW_LOG_DIR ?? 此值`——**每次 run** 解析
+ * （不是 compile 期常量），测试 worker 里后设的环境变量因此也能生效。
+ */
+const DEFAULT_LOG_DIR = ".pi-workflow/runs";
+
+/**
+ * 日志失败的消息前缀（D8/T2 裁定）：内置 logger 抛出的错误已经带这个前缀
+ * （`Error("run log write failed: <原因>")`）——引擎**不重复拼接**，只在缺失时补一次。
+ */
+const LOG_FAILURE_PREFIX = "run log write failed: ";
 
 /** 待执行实例；input 是激活时刻 state 的只读快照（普通触发，设计 §5.1）。 */
 type Instance = {
@@ -155,6 +182,10 @@ export function resolveServices(services?: Services): ResolvedServices {
 		clock: services?.clock ?? Date.now,
 		sleep: services?.sleep ?? defaultSleep,
 		random: services?.random ?? Math.random,
+		// 日志实现（Task 3，D2）：**不做默认化**——`undefined` 的含义是"用内置 JSONL 实现"，
+		// 而默认目录要在 **run 期**解析（`logDir` 是 run 选项，`PI_WORKFLOW_LOG_DIR` 每次 run
+		// 读）。`!== undefined`（含空对象 `{}`）原样保留，由 runGraph 决定用法。
+		logger: services?.logger,
 	};
 }
 
@@ -285,12 +316,96 @@ async function runGraph<S extends object>(
 	assertInitialState(graph, initial);
 
 	const runId = crypto.randomUUID();
+	const startedAt = services.clock();
+	// 日志选项归一（D2/D8）：缺省 full / fail；非法值（JS 调用方）回落缺省——
+	// 与 recursionLimit / 预算的非有限值兜底同一策略。
+	const logOutputs = resolveLogOutputs(options.logOutputs);
+	const onLogError = resolveOnLogError(options.onLogError);
+	// 日志装配（D2）：`services.logger !== undefined` → 原样使用（`{}` = 钩子全缺省 =
+	// 全静默）；否则用内置 JSONL 实现——目录**每次 run** 解析（见 DEFAULT_LOG_DIR）。
+	const logger: RunLogger =
+		services.logger ??
+		createJsonlLogger({
+			dir: options.logDir ?? process.env.PI_WORKFLOW_LOG_DIR ?? DEFAULT_LOG_DIR,
+			runId,
+			ts: startedAt,
+		});
+
+	/**
+	 * 首个日志钩子错误（D8）：只有第一个有用（后续是同一故障的重复，噪音无益），
+	 * 但**不吞**——fail 策略下它成为 run 的拒绝体（审计优先，D2），
+	 * warn 策略下每次失败都 `console.warn`（D8 的规定动作），run 继续。
+	 */
+	let logThrew = false;
+	let logError: unknown;
+
+	/** run 是否已因日志失败判死（仅 `fail` 策略；收尾判定用）。 */
+	const logFailed = (): boolean => logThrew && onLogError === "fail";
+
+	/**
+	 * 日志失败拒绝体（D8）：`WorkflowError`，消息 = 日志失败文本（T2 裁定：内置 logger
+	 * 的错误已带 `run log write failed: ` 前缀，**不重复拼接**），`cause` = logger 钩子
+	 * 抛出的原错（内置实现的原错自带 fs 原因链）。
+	 */
+	const logRejection = (error: unknown): WorkflowError => {
+		const rejection = new WorkflowError(logFailureMessage(error));
+		rejection.cause = error;
+		return rejection;
+	};
+
+	/**
+	 * 日志钩子错误的总入口（D8）：`fail`（默认）**立即中止 run signal**，理由 = 拒绝体——
+	 * 审计优先：写不了日志的 run 必须失败。中止复用既有 run 级取消出口：`superstep_aborted`
+	 * （适用时）+ `run_finished{failed}` 照常发给 onEvent，收尾以该拒绝体抛出（见
+	 * finishRun/finishCancelledRun）。`warn` 只告警，不碰 run 状态。
+	 */
+	const onLogFailure = (error: unknown): void => {
+		if (!logThrew) {
+			logThrew = true;
+			logError = error;
+		}
+		if (onLogError === "warn") {
+			console.warn(`pi-workflow: ${logFailureMessage(error)}`);
+			return;
+		}
+		if (!runController.signal.aborted) {
+			runController.abort(logRejection(error));
+		}
+	};
+
+	/**
+	 * 第二 sink（D7/D8）：logger 的 `onEvent`。钩子错误绝不逃进 emitter 的监听器通道
+	 * （"logger 是独立 sink，有自己的 D8 策略"）——捕获后交给 onLogFailure；
+	 * 因此日志失败不影响任何一次 onEvent 投递。
+	 */
+	const onLogEvent = (event: RunEvent): void => {
+		try {
+			logger.onEvent?.(event);
+		} catch (error) {
+			onLogFailure(error);
+		}
+	};
+
 	const emitter = createEmitter({
 		runId,
 		clock: services.clock,
 		onEvent: options.onEvent,
+		onLogEvent,
+		// hash 脱敏（D7）在 emitter 里对每个事件做一次：两路拿同一个脱敏后对象。
+		transform: logOutputs === "hash" ? redactEvent : undefined,
 	});
-	const startedAt = services.clock();
+
+	// 日志启动（D8 末句）：**preflight 通过后**才碰 logger——`onRunStart` 失败时
+	// `run_started` 还没发："一个事件都不发"（含 run_finished），直接以拒绝体抛（fail；
+	// 此时没有任何事件可作边界）或 console.warn（warn）。
+	try {
+		logger.onRunStart?.({ runId, graph: graph.name, ts: startedAt });
+	} catch (error) {
+		if (onLogError === "fail") {
+			throw logRejection(error);
+		}
+		console.warn(`pi-workflow: ${logFailureMessage(error)}`);
+	}
 	// NaN / ±Infinity 会让 `superstep > recursionLimit` 的比较全部失效（界限形同虚设）：
 	// 非有限值一律回落默认 25（T8 review）。
 	const requestedLimit = options.recursionLimit;
@@ -375,6 +490,13 @@ async function runGraph<S extends object>(
 		input: initial,
 	});
 
+	/**
+	 * run 收尾（D8）：发 `run_finished` → 通知 logger 的 `onRunFinish` → **判定日志失败**。
+	 * - `onRunFinish` 收到的 `ts` 取收尾时刻的时钟（与事件的 ts 同一来源）；
+	 * - 收尾处发现日志失败（本函数内或此前任一处）时，fail 策略下**由这里抛出拒绝体**：
+	 *   主失败的出口路径也会经过本函数，因此"日志失败优先于退出路径上的主失败身份"
+	 *   （审计优先，D2；事件流里主失败照旧完整，见文件头的策略注释）。
+	 */
 	const finishRun = (
 		superstep: number,
 		status: "completed" | "failed",
@@ -385,6 +507,17 @@ async function runGraph<S extends object>(
 			status,
 			durationMs: elapsedMs(services, startedAt),
 		});
+		try {
+			logger.onRunFinish?.({ runId, status, ts: services.clock() });
+		} catch (error) {
+			onLogFailure(error);
+		}
+		if (logFailed()) {
+			const rejection = logRejection(logError);
+			// 监听器错误照旧附随（同 finishCancelledRun 的收尾）：不静默。
+			attachListenerError(rejection);
+			throw rejection;
+		}
 	};
 
 	/**
@@ -517,8 +650,17 @@ async function runGraph<S extends object>(
 	}
 
 	for (;;) {
+		// 日志失败（D8 fail）在"正常结束"之前拦截：日志已断的 run 不得声称 completed，
+		// 走失败出口（run_finished{failed}），拒绝体 = 首个日志错误（审计优先）。
+		// 放在"正常结束"判定之前、但**不动**既有的 runSignal 检查顺序：取消在超步边界
+		// 输给"已经跑完"（M1 语义），日志失败则相反——它不是调用方的意图，是基础设施故障。
+		if (logFailed()) {
+			finishCancelledRun(lastSuperstep, false);
+		}
+
 		if (pending.length === 0) {
 			// 正常结束：分支全部终止（到达 END / 无后继，§5.5）。
+			// finishRun 内部先发 run_finished（可能因日志失败抛出拒绝体，见 D8）。
 			finishRun(lastSuperstep, "completed");
 			reportListenerError();
 			return { state, runId };
@@ -1122,6 +1264,41 @@ function resolveMaxConcurrency(requested: number | undefined): number {
 		return DEFAULT_MAX_CONCURRENCY;
 	}
 	return Math.max(1, Math.floor(requested));
+}
+
+/**
+ * 日志脱敏模式（D7）：缺省 `"full"`；只有字面量 `"hash"` 生效，其余（JS 调用方传的
+ * 怪值）回落缺省——与上面的数值选项兜底同一策略。
+ */
+function resolveLogOutputs(
+	requested: RunOptions["logOutputs"],
+): "full" | "hash" {
+	return requested === "hash" ? "hash" : "full";
+}
+
+/**
+ * 日志失败策略（D8）：缺省 `"fail"`（审计优先——日志写不了，run 必须失败）；
+ * 非法值回落缺省；只有字面量 `"warn"` 降级为"只告警、不阻断"。
+ */
+function resolveOnLogError(
+	requested: RunOptions["onLogError"],
+): "fail" | "warn" {
+	return requested === "warn" ? "warn" : "fail";
+}
+
+/**
+ * 日志失败的可读文本（D8/T2 裁定）：内置 logger 抛出的错误已经是
+ * `run log write failed: <原因>`（runlog.ts 的包装契约）——**复用它的消息、不重复前缀**；
+ * 自定义 logger 抛出的任意错误则补上同一前缀一次，让 fail/warn 两条路径的可见消息与
+ * 文档一致（`WorkflowError("run log write failed: …")` /
+ * `console.warn("pi-workflow: run log write failed: …")`）。渲染沿用 messageOf
+ * （非 Error 的抛值也能出可读文本）。
+ */
+function logFailureMessage(error: unknown): string {
+	const text = messageOf(error);
+	return text.startsWith(LOG_FAILURE_PREFIX)
+		? text
+		: `${LOG_FAILURE_PREFIX}${text}`;
 }
 
 /**

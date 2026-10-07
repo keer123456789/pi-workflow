@@ -154,6 +154,14 @@ export type ResolvedServices = {
 	clock: () => number;
 	sleep: (ms: number) => SleepResult;
 	random: () => number;
+	/**
+	 * run 日志实现（Task 3，D2）：从 `Services.logger` **原样**传递——**不做默认化**。
+	 * `undefined` = "用内置 JSONL 实现"，具体装配在 run 期完成（默认目录要按 run 解析：
+	 * `logDir` → `PI_WORKFLOW_LOG_DIR` → `.pi-workflow/runs`）；`!== undefined` 原样使用
+	 * （空对象 `{}` = 钩子全缺省 = 全静默）。可选字段：手工装配 ResolvedServices 的
+	 * 调用方不必提供。
+	 */
+	logger?: RunLogger;
 };
 
 /**
