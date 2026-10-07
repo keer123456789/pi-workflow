@@ -331,6 +331,41 @@ describe("fail-fast cancellation and collateral (设计 §7.1/§7.4)", () => {
 		expect(aRuns.count).toBe(1);
 	});
 
+	it("classifies a shape-invalid fulfilment of a cancelled instance as collateral, not as root (R20a)", async () => {
+		const events: RunEvent[] = [];
+		const boom = new Error("b blew up");
+		const gate = deferred();
+
+		// a 的 handler 无视 ctx.signal：被取消之后才 fulfil，且返回数组（形状非法）。
+		// R20a 的取消判定先于形状判定——否则 a#1（seq 更小）会被形状错误推上根因，
+		// 掩盖真正触发的 b#2。
+		const g = parallel(
+			fnNode<S>(async () => {
+				await gate.promise;
+				return [] as unknown as Partial<S>;
+			}),
+			fnNode<S>(() => {
+				throw boom;
+			}),
+		);
+
+		const handle = run(g, {}, { onEvent: (e) => events.push(e) });
+		await tick(); // b#2 已失败并 abort 了 a#1（a 仍挂在 gate 上）
+		gate.resolve();
+
+		const error = await captureRejection(handle);
+
+		expect(error).toBeInstanceOf(NodeExecutionError);
+		const nodeError = error as NodeExecutionError;
+		// 根因 = b#2（真正的失败），不是被取消后才返回非法形状的 a#1
+		expect(nodeError.node).toBe("b");
+		expect(nodeError.instanceId).toBe("b#2");
+		expect(nodeError.cause).toBe(boom);
+		expect(nodeError.collateral).toEqual(["a#1"]);
+		expect(ofType(events, "node_failed").map((e) => e.node)).toEqual(["b"]);
+		expect(ofType(events, "node_finished")).toHaveLength(0);
+	});
+
 	it("emits no node_retry for a cancelled instance that fails with a plain error (R20a)", async () => {
 		const events: RunEvent[] = [];
 		const boom = new Error("b blew up");

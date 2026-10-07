@@ -31,7 +31,7 @@
  * 重试（T11，§7.2）：`retry.maxAttempts` 是**总尝试次数**（含首次，默认 1 = 不重试）。
  * 非取消失败后按 full jitter 退避 `min(500 * 2^已重试次数 * random(), 30_000)`（注入的
  * sleep/random，时序可测），每次重试前发 `node_retry`（attempt = 刚失败的那次尝试编号）。
- * 取消类失败（run/兄弟取消引起的 AbortError 或 signal.reason 本体）**不重试**。
+ * 取消类失败（实例信号已 abort 时到达的**任何**失败，与错误形状/类型无关，R20a）**不重试**。
  *
  * 超时（T11，§7.3）：只有节点显式配置 `timeoutMs` 才有单次尝试超时（fn 无默认超时；
  * llm/agent 的 120s/600s 默认值 M2 由节点工厂落进该字段）。到期 abort attempt signal，
@@ -59,7 +59,23 @@
  * 触发规则（§5.4）：普通边目标与 router 字符串结果共享同一去重表（按节点名，保留最早
  * 实例）；Send 实例不去重，input 即 Send 载荷（§5.3）。router 每节点每超步求值一次，
  * 读提交后的合并 state 与该节点本超步自身写入的 fold（§4.2）。
- * 仍不含：实例预算与并发上限（T12）；JSONL 落盘（log/runlog.ts）。
+ *
+ * 预算护栏与 I/O 并发（T12，§5.1:325-327/§5.3/§4.4）：检查点在**生成下一批之后、执行
+ * 之前**（循环顶部，pending 已含本超步要跑的全部实例）——
+ * - `maxInstancesPerSuperstep`（默认 1000）：`pending.length > limit` → 抛
+ *   `InstanceBudgetError{kind: "superstep"}`；
+ * - `maxTotalInstances`（默认 10000）：累计**创建**数（createInstance 的计数器，
+ *   含排队未启动的）> limit → `InstanceBudgetError{kind: "total"}`；
+ * 越限的那一批一个实例都不执行（没有 node_started/node_failed），也没有超步边界
+ * （什么都没跑，superstep_aborted 无意义）：事件流以 `run_finished{failed}` 收尾，
+ * `superstep` = 该批**将被执行**的超步号（与 recursionLimit 的"尝试超步"同一编号规则）。
+ * 两个预算的非有限值回落默认（与 recursionLimit 同一策略）。
+ * `maxConcurrency`（默认 8）按"槽位 + 队列"调度：同超步同时执行的实例封顶，超出的
+ * 排队等槽位、槽位一空按实例序启动；排队中的实例不是"已启动"（不发事件），其信号
+ * 被 fail-fast/run 取消 abort 后永不执行——executeInstance 入口守卫直接归为
+ * InstanceCancelledError（记进 collateral）。并发是 **I/O 并发**（§10 的并发模型说明）：
+ * CPU 密集的 fn 节点会阻塞事件循环，这个上限对它无效。
+ * 仍不含：JSONL 落盘（log/runlog.ts）。
  *
  * 两个计数器互不相干（R2），都在 run 内全局单调：
  * - `instanceSeq`：NodeDefinition 的激活序 —— instanceId = `${name}#${seq}`，也是合并顺序（§5.2）；
@@ -72,6 +88,7 @@ import { createEmitter, type RunEmitter } from "../log/emitter.js";
 import {
 	GraphRecursionError,
 	GraphValidationError,
+	InstanceBudgetError,
 	InvalidWriteError,
 	NodeExecutionError,
 	RouterError,
@@ -104,6 +121,13 @@ import {
 const BASE_BACKOFF_MS = 500;
 /** 退避上限（§7.2）：30s。 */
 const MAX_BACKOFF_MS = 30_000;
+
+/** 单超步实例数上限的默认值（§4.4/§5.3）：1000。 */
+const DEFAULT_MAX_INSTANCES_PER_SUPERSTEP = 1000;
+/** 整 run 实例总数上限的默认值（§4.4/§5.3）：10000。 */
+const DEFAULT_MAX_TOTAL_INSTANCES = 10_000;
+/** 同超步 I/O 并发上限的默认值（§4.4/§5.1:327）：8。 */
+const DEFAULT_MAX_CONCURRENCY = 8;
 
 /** 待执行实例；input 是激活时刻 state 的只读快照（普通触发，设计 §5.1）。 */
 type Instance = {
@@ -274,6 +298,18 @@ async function runGraph<S extends object>(
 		requestedLimit !== undefined && Number.isFinite(requestedLimit)
 			? requestedLimit
 			: 25;
+
+	// 预算与 I/O 并发（T12，§4.4/§5.1:325-327）：默认 1000 / 10000 / 8。非有限值一律
+	// 回落默认——NaN 会让所有比较失效、Infinity 会让界限形同虚设（与 recursionLimit 同一策略）。
+	const maxInstancesPerSuperstep = resolveBudgetLimit(
+		options.maxInstancesPerSuperstep,
+		DEFAULT_MAX_INSTANCES_PER_SUPERSTEP,
+	);
+	const maxTotalInstances = resolveBudgetLimit(
+		options.maxTotalInstances,
+		DEFAULT_MAX_TOTAL_INSTANCES,
+	);
+	const maxConcurrency = resolveMaxConcurrency(options.maxConcurrency);
 
 	// run 级信号（§7.4）：三条触发路径——外部 signal、RunHandle.cancel()、runTimeoutMs。
 	const runSignal = runController.signal;
@@ -506,10 +542,46 @@ async function runGraph<S extends object>(
 			throw error;
 		}
 
-		// (b) 本超步实例并发执行（I/O 并发）。每个实例一个取消源（fail-fast 用，§7.4）：
+		// 预算护栏（T12，§5.1:325-326/§5.3）：检查点在**生成下一批之后、执行之前**
+		// （pending 已含本超步要跑的全部实例）。越限的这一批一个实例都不执行——没有
+		// node_started / node_failed，也没有 superstep_aborted 边界（什么都没跑，没有
+		// "被中止的超步"可言）；事件流以 run_finished{failed} 收尾，superstep = 该批
+		// **将被执行**的超步号（attempted superstep，与 recursionLimit 同一编号规则）。
+		if (pending.length > maxInstancesPerSuperstep) {
+			finishRun(superstep, "failed");
+			const error = new InstanceBudgetError(
+				`superstep ${superstep} (attempted) would run ${pending.length} instances, exceeding maxInstancesPerSuperstep of ${maxInstancesPerSuperstep}`,
+				{ kind: "superstep", limit: maxInstancesPerSuperstep },
+			);
+			attachListenerError(error);
+			throw error;
+		}
+		// 累计预算数的是**创建**而不是执行（createInstance 分配的 seq 数）：排队中的实例
+		// 同样占额度——否则 maxConcurrency 会成为绕开整 run 预算的后门。
+		const instancesCreated = nextInstanceSeq - 1;
+		if (instancesCreated > maxTotalInstances) {
+			finishRun(superstep, "failed");
+			const error = new InstanceBudgetError(
+				`this run has created ${instancesCreated} instances by attempted superstep ${superstep}, exceeding maxTotalInstances of ${maxTotalInstances}`,
+				{ kind: "total", limit: maxTotalInstances },
+			);
+			attachListenerError(error);
+			throw error;
+		}
+
+		// (b) 本超步实例并发执行（I/O 并发，maxConcurrency 封顶，§5.1:327）。每个实例一个
+		// 取消源（fail-fast 用，§7.4）：**整批实例的取消源先全部建好**——包括还在队列里
+		// 等待启动的那些。兄弟失败时排队中的实例也一起 abort，它们因此永远不会执行
+		// （executeInstance 入口守卫直接归为 InstanceCancelledError → collateral）。
 		// 实例 settle 即从表里摘除——"仍在运行的兄弟实例"是 abort 的具体范围（已完成的
-		// 实例信号不再被碰）。
+		// 实例信号不再被碰）；下标与 pending 对齐（调度器按 pending 下标取取消源）。
+		const instanceControllers: AbortController[] = [];
 		const instanceAborts = new Map<string, AbortController>();
+		for (const instance of pending) {
+			const controller = new AbortController();
+			instanceControllers.push(controller);
+			instanceAborts.set(instance.instanceId, controller);
+		}
 		const abortSiblingInstances = (failedInstanceId: string): void => {
 			const reason = new WorkflowError(
 				`instance "${failedInstanceId}" failed: cancelling sibling instances (fail-fast)`,
@@ -523,24 +595,24 @@ async function runGraph<S extends object>(
 		};
 
 		// 全部 settle 后再决策：失败候选取实例序最小的那个（完成序不参与选择，确定性 §5.2）。
-		const settled = await Promise.allSettled(
-			pending.map((instance) => {
-				const controller = new AbortController();
-				instanceAborts.set(instance.instanceId, controller);
-				return executeInstance({
+		// 调度：最多 maxConcurrency 个实例同时在跑，超出的按实例序排队等槽位（§4.4）。
+		const settled = await settleWithConcurrencyLimit(
+			pending,
+			maxConcurrency,
+			(instance, index) =>
+				executeInstance({
 					graph,
 					instance,
 					superstep,
 					runId,
 					runSignal,
-					instanceController: controller,
+					instanceController: instanceControllers[index],
 					abortSiblings: () => abortSiblingInstances(instance.instanceId),
 					emitter,
 					services,
 				}).finally(() => {
 					instanceAborts.delete(instance.instanceId);
-				});
-			}),
+				}),
 		);
 
 		// run 取消/超时优先于实例失败（§7.4）：本超步整体不提交，边界 superstep_aborted。
@@ -630,6 +702,42 @@ async function runGraph<S extends object>(
 }
 
 /**
+ * I/O 并发上限（T12，§4.4/§5.1:327）：最多 `limit` 个实例同时执行，其余按数组顺序
+ * （实例 seq 升序）排队，槽位一空就启动下一个——启动顺序恒为实例序，与完成顺序无关。
+ * 产物与 `Promise.allSettled` 同形（按下标对齐），失败候选的确定性选举（§5.2）不变。
+ *
+ * 排队中的实例不算"已启动"：不占槽位、不发事件；轮到它时才走 `start`（executeInstance），
+ * 入口守卫在信号已 abort 时立即抛 InstanceCancelledError——handler 不会被调用。
+ * 每个下标恰被一个 worker 领取一次（领取与计数之间没有 await），因此不会漏项或重复。
+ */
+async function settleWithConcurrencyLimit<T, R>(
+	items: readonly T[],
+	limit: number,
+	start: (item: T, index: number) => Promise<R>,
+): Promise<PromiseSettledResult<R>[]> {
+	const results: PromiseSettledResult<R>[] = new Array(items.length);
+	let nextIndex = 0;
+	const worker = async (): Promise<void> => {
+		for (;;) {
+			const index = nextIndex;
+			if (index >= items.length) {
+				return;
+			}
+			nextIndex += 1;
+			try {
+				const value = await start(items[index], index);
+				results[index] = { status: "fulfilled", value };
+			} catch (reason) {
+				results[index] = { status: "rejected", reason };
+			}
+		}
+	};
+	const workers = Math.min(limit, items.length);
+	await Promise.all(Array.from({ length: workers }, () => worker()));
+	return results;
+}
+
+/**
  * (b) 单个实例：node_started →（开发模式冻结输入）→ 尝试循环（handler + 重试/超时）→
  * node_finished；永久失败（重试耗尽 / 返回形状非法 / 未注册 / 退避服务故障）走
  * node_failed + NodeExecutionError，并 fail-fast 取消仍在运行的兄弟实例。
@@ -639,9 +747,11 @@ async function runGraph<S extends object>(
  * 每次尝试新建，它就是 ctx.signal（types.ts 的 NodeContext 注释）。
  * **尝试超时只 abort 本尝试**：不影响实例/run，也不影响下一次尝试。
  *
- * 取消（实例信号 abort 且失败由其引起）**不是失败**：抛 InstanceCancelledError，
- * 不发 node_failed、不重试——由调用方记进 collateral（返回形状非法的失败不重试：
- * 那是代码错误，与 §7.1"fn 不自动重试"同源；llm 的 schema 重试走 M2 的适配层）。
+ * 取消（R20a）**不是失败**：实例信号已 abort 时，**任何**失败都判取消——与错误形状/
+ * 类型无关（AbortError、`signal.reason` 本体、被取消的节点自己抛的普通错误、乃至"信号已
+ * abort 后 handler 无视信号 fulfil 出非法形状"）。抛 InstanceCancelledError：不发
+ * node_failed、不重试——由调用方记进 collateral。形状非法**未**伴随取消时仍按节点失败
+ * 处理（那是不重试的代码错误，与 §7.1"fn 不自动重试"同源；llm 的 schema 重试走 M2 适配层）。
  */
 async function executeInstance<S extends object>(args: {
 	graph: CompiledGraphData<S>;
@@ -666,9 +776,9 @@ async function executeInstance<S extends object>(args: {
 		services,
 	} = args;
 
-	// 防御：实例在开跑前就已被取消（当前调度下同批实例都在同一个同步块里启动，正常
-	// 到不了这里；取消的判定时机在实例内）。节点从未开始 → 不发任何事件（连 node_started
-	// 都没有）：记进 collateral 即完整的交代。
+	// 实例在开跑前就已被取消：maxConcurrency 调度下，排队等待的实例会在轮到它之前
+	// 因兄弟失败（fail-fast）或 run 取消被 abort——它必须**永不执行**。节点从未开始 →
+	// 不发任何事件（连 node_started 都没有）：记进 collateral 即完整的交代。
 	if (instanceController.signal.aborted || runSignal.aborted) {
 		throw new InstanceCancelledError(instance.instanceId);
 	}
@@ -758,8 +868,14 @@ async function executeInstance<S extends object>(args: {
 			const output = outcome.value;
 			// 返回形状：数组 / 原始值不是合法的 Partial<S>——曾经被静默当无写入（T8 review），
 			// 掩盖 bug，现在按节点失败处理（有 writeTo 的节点例外，见 shapeFailureOf）。
+			// 取消判定先于形状判定（R20a）：实例信号已 abort 时，无视信号、fulfil 出非法
+			// 形状的 handler 也算"被取消"——否则它会以更小的实例序被选成根因，掩盖真正
+			// 触发取消的那个失败。
 			const shapeError = shapeFailureOf(definition, output);
 			if (shapeError !== undefined) {
+				if (instanceSignal.aborted) {
+					throw new InstanceCancelledError(instance.instanceId);
+				}
 				fail(shapeError);
 			}
 			emitter.emit({
@@ -969,6 +1085,32 @@ function resolveTimeoutMs(timeoutMs: number | undefined): number | undefined {
 		return undefined;
 	}
 	return timeoutMs;
+}
+
+/**
+ * 实例预算（T12，§4.4/§5.3）：未指定或非有限 → 默认值（NaN 与 ±Infinity 都会让
+ * `pending.length > limit` / `累计 > limit` 的比较失效，护栏形同虚设——与 recursionLimit
+ * 同一兜底策略）。有限值原样用：`0`/负数 = "一个实例都不许有"（任何非空批次都越限）。
+ */
+function resolveBudgetLimit(
+	requested: number | undefined,
+	fallback: number,
+): number {
+	if (requested === undefined || !Number.isFinite(requested)) {
+		return fallback;
+	}
+	return requested;
+}
+
+/**
+ * I/O 并发上限（T12，§4.4）：未指定或非有限 → 默认 8（同上，"不限额"不是 M1 的契约）。
+ * 有限值下限 1：0 / 负数若原样用，槽位数是 0——调度器一个实例都不会启动（死锁）。
+ */
+function resolveMaxConcurrency(requested: number | undefined): number {
+	if (requested === undefined || !Number.isFinite(requested)) {
+		return DEFAULT_MAX_CONCURRENCY;
+	}
+	return Math.max(1, Math.floor(requested));
 }
 
 /**
