@@ -409,7 +409,7 @@ for step in 0..:
 2. `START` 必须有出边；从 `START` 出发所有节点可达（不可达 = 警告）；
 3. 无出边且无 router 的节点视为终态（警告提示显式连 `END`）；
 4. 重复 `addEdge(from,to)`、重复 `addConditionalEdges(from)`、对同一节点的重复 `addNode` → 即时抛错；
-5. `writeTo` 的 key 必须存在于 State；llm/agent 节点必须提供 `writeTo`；schema 必须合法（typebox 对象本身即 JSON Schema）；；"__proto__" 不得作为 channel key 或 writeTo（原型污染防护，R24）
+5. `writeTo` 的 key 必须存在于 State；llm/agent 节点必须提供 `writeTo`；schema 必须合法（typebox 对象本身即 JSON Schema）；"__proto__" 不得作为 channel key 或 writeTo（原型污染防护，R24）
 6. `executor` 声明的适配器必须在 `services` 中已配置（§4.6）；`complete` 缺失且 pi-ai 未安装 → 报错；
 7. `stateSchema` 若提供：校验其自身合法性；初始 state 校验在 `run()` 开始时做（初始 state 必须通过 `stateSchema`，节点返回含未知 key 抛 `InvalidWriteError`）；
 8. compile 之后再调用 `addNode/addEdge/addConditionalEdges` → 抛 `GraphSealedError`（"compile 后不可变"由代码强制）；
@@ -469,7 +469,7 @@ for step in 0..:
 {"ts":"...","type":"run_finished","runId":"...","status":"completed|failed","durationMs":...}
 ```
 
-- **所有事件带 `seq` 与 `superstep`**；失败超步的事件打标 `committed:false`，并追加 `superstep_aborted` 事件——事件溯源重放（v2）只重放 committed 超步；；seq 从 1 起单调递增
+- **所有事件带 `seq` 与 `superstep`**；失败超步的事件打标 `committed:false`，并追加 `superstep_aborted` 事件——事件溯源重放（v2）只重放 committed 超步；seq 从 1 起单调递增
 - `node_retry`（每次重试前一条）字段 = 样例的 `node` / `instanceId` / `attempt` / `error`；`attempt` 是**刚失败的那次尝试**编号（1 起），`error` 是失败错误的消息文本；只在"重试确实会发生"时发出（实例已取消就不发，R20a）；`node_finished.durationMs` 是**实例墙钟时长**，含重试与退避（不是最后一次尝试的耗时）；
 - 事件同时经 `onEvent` 实时发出：**顺序保证 = 完成序（实时性优先）**，字段 `seq` 供需要全序的消费者（重放、审计）重排；
 - `logOutputs: "hash"` 模式下 input/output 只记 SHA-256（法律文书敏感；`onEvent` 同样受此开关约束，避免全文经回调泄露）；
