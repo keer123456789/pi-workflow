@@ -803,7 +803,8 @@ describe("dev-mode input freeze (设计 §5.1:352)", () => {
 			.addEdge(START, "a")
 			.addEdge("a", END);
 
-		await run(g, initial);
+		// 循环载荷在 full 模式日志下会触发 D8 的日志写失败（属接受行为）；本用例主题是冻结守卫，用 hash 模式（D7 对不可序列化载荷有 "[unserializable]" 兜底）绕开日志层。
+		await run(g, initial, { logOutputs: "hash" });
 
 		expect(Object.isFrozen(initial)).toBe(true);
 		expect(Object.isFrozen(initial.self)).toBe(true);

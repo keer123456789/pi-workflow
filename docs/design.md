@@ -480,7 +480,7 @@ for step in 0..:
 - `node_finished.usage?`（D11）：成功尝试经 `ctx.reportUsage` 上报的用量（按 attempt 取末次）；未上报时字段缺省，失败/重试的尝试不产生 usage；
 - 事件同时经 `onEvent` 实时发出：**顺序保证 = 完成序（实时性优先）**，字段 `seq` 供需要全序的消费者（重放、审计）重排；
 - **脱敏（`logOutputs: "hash"`，D7）**：`run_started.input`、`node_started.input`、`node_finished.output` 三字段替换为字符串 `"sha256:<64位hex>"`（`sha256(JSON.stringify(value))`；stringify 抛错时对 `"[unserializable]"` 取哈希）——**onEvent 与日志文件两路都拿脱敏后的事件**（避免全文经回调泄露，法律文书敏感）；
-- **日志写失败（D8）**：默认 `onLogError: "fail"`——logger 任一钩子抛错使 run 以 `WorkflowError("run log write failed: <原因>")` 拒绝、`cause` 附原错，含收尾阶段（`run_finished` 已发后 `onRunFinish` 抛错同样拒绝；审计要求）；`"warn"` 的确切降级行为 = `console.warn("pi-workflow: run log write failed: <原因>")` 并继续；**预检失败**（初始 state 校验 / 已 abort 的 signal）的 run 不创建日志；
+- **日志写失败（D8）**：默认 `onLogError: "fail"`——logger 任一钩子抛错使 run 以 `WorkflowError("run log write failed: <原因>")` 拒绝、`cause` 附原错，含收尾阶段（`run_finished` 已发后 `onRunFinish` 抛错同样拒绝；审计要求）；`"warn"` 的确切降级行为 = `console.warn("pi-workflow: run log write failed: <原因>")` 并继续；**预检失败**（初始 state 校验 / 已 abort 的 signal）的 run 不创建日志；full 模式下不可序列化 payload（循环引用 / BigInt 等）属日志写失败，按 onLogError 策略处置；hash 模式对其有 "[unserializable]" 哈希兜底（D7）。
 - 日志是 v2 断点续跑的数据基础（事件溯源 + seq 重放）。
 
 ---
