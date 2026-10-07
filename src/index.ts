@@ -1,10 +1,9 @@
 /**
- * 包公开面（设计 §4/§7.5/§10）：M1 的全部公开 API 与公开类型。
+ * 包公开面（设计 §4/§7.5/§10）：M1 的全部公开 API 与公开类型 + M2 新增（llmNode 与三类型）。
  *
  * 口径是**不增不漏**——逐名列出，不多导一个、也不少导一个：
- * - 运行期值：StateGraph / Send / START / END / fnNode（M1 只有 fn 工厂；llmNode 随 M2
- *   后续任务加入）、4 个标准 reducer（overwrite/append/concat/setOnce）、9 个错误类、
- *   interpolate；
+ * - 运行期值：StateGraph / Send / START / END / 节点工厂（fnNode / llmNode）、4 个标准
+ *   reducer（overwrite/append/concat/setOnce）、9 个错误类、interpolate；
  * - 类型：前序任务 Interfaces 冻结的公开类型（NodeContext…SleepResult），一律 `export type`
  *   （只在类型位置存在，运行期无痕迹）；M2 增 `TokenUsage` / `CompleteFn` / `RunLogger`。
  *
@@ -58,6 +57,7 @@ export { END, START } from "./core/types.js";
 // —— M2 公开类型（设计 §8/§9.1）：日志注入点与补全接口 ——
 export type { RunLogger } from "./log/runlog.js";
 export { fnNode } from "./nodes/fn.js";
+export { llmNode } from "./nodes/llm.js";
 export type { CompleteFn, TokenUsage } from "./runtime/executor.js";
 // —— 模板插值（设计 §5.6） ——
 export { interpolate } from "./template.js";

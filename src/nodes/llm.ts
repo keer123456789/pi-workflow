@@ -21,6 +21,9 @@
  * 先 `ctx.reportUsage(usage)`（仅 complete 报了 usage 才调，D11），再返回**解析值本身**
  * ——`{ [writeTo]: 值 }` 的包裹由引擎 `updateOf` 完成（§5.1:354）。
  *
+ * 注意（§5.6）：string prompt 含字面 JSON 花括号（如 `Return {"answer": …}`）会被当作
+ * 模板插值并抛**不可重试**的 `TemplateError`——字面花括号必须转义为 `{{` / `}}`。
+ *
  * 未绑定的定义其 handler 是占位函数：直接调用抛 "llm node is not bound"（compile
  * 保证编译产物里的 llm 节点都已绑定，运行期到不了这里；手工直接调用属误用）。
  */

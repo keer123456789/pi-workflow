@@ -556,12 +556,12 @@ pi-workflow/
       send.ts
       errors.ts           # GraphValidationError / GraphSealedError / RouterError / InvalidWriteError
                           # / GraphRecursionError / InstanceBudgetError / NodeExecutionError / TemplateError
-      types.ts            # CompileOptions / RunEvent / TokenUsage / NodeDefinition / CompiledGraph 等（全部公开）
+      types.ts            # CompileOptions / RunEvent / NodeDefinition / CompiledGraph 等（全部公开）
     nodes/
       fn.ts  llm.ts  agent.ts
     template.ts           # {key} 插值（§5.6）
     runtime/
-      executor.ts         # AgentExecutor / CompleteFn 接口
+      executor.ts         # AgentExecutor / CompleteFn 接口 / TokenUsage 类型
       pi-subprocess.ts
       pi-sdk.ts
       llm-pi-ai.ts
@@ -609,7 +609,7 @@ pi-workflow/
 |---|---|---|
 | **M0** | **pi subprocess 协议 spike**：验证 stdin 传 prompt、JSON 事件流格式（冻结字段清单）、schema 指令可行性、Windows spawn/taskkill、CLI 版本探测 | 产出《子进程协议》小节并入 §9.2；此后协议变更视为破坏性 |
 | M1 | core 引擎：图构建/校验/封印/超步/去重/seq/预算/信号层级/模板 | §12 的 core 测试与确定性测试全绿 —— **完成**（M1 核心引擎，公开面见 src/index.ts） |
-| M2 | llm 节点 + pi-ai 默认 complete + run 日志 | schema 校验与 maxAttempts 重试生效；run.jsonl 落盘且含 seq/superstep/committed 标记 |
+| M2 | llm 节点 + pi-ai 默认 complete + run 日志 | schema 校验与 maxAttempts 重试生效；run.jsonl 落盘且含 seq/superstep/committed 标记（committed = `superstep_committed`/`superstep_aborted` 边界事件，见 §8.1）—— **完成**（llmNode / JSONL 日志 / pi-ai 适配器见 src/nodes/llm.ts、src/log/runlog.ts、src/runtime/llm-pi-ai.ts） |
 | M3 | subprocess 适配器 | 真实 pi CLI 联调按 M0 协议通过；超时 taskkill、usage 统计、临时文件清理 |
 | M4 | sdk 适配器 | 进程内跑通 agent 节点；optional peer 生效 |
 | M5 | README、合同审查完整示例、发布准备 | npm pack 可安装；示例开箱即跑；langgraph 黄金用例全绿 |
