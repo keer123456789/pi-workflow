@@ -81,9 +81,10 @@ export function llmNode<S, K extends keyof S & string>(cfg: {
 		timeoutMs,
 	};
 	// 占位 handler（每次调用都是新函数——WeakMap 键不跨定义串味）：绑定前被调用即误用。
+	// 措辞面向节点作者（不引导去调内部函数 bindLlmNode）：绑定发生在 compile 期。
 	const handler: NodeHandler<S, S> = () => {
 		throw new Error(
-			"llm node is not bound: call bindLlmNode(def, complete) before invoking the handler (compile() binds llm nodes automatically)",
+			"llm node is not bound: llm nodes are bound at compile time — compile the graph before running it",
 		);
 	};
 	const def: NodeDefinition<S> = {

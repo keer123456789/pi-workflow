@@ -8,6 +8,7 @@
  */
 
 import { Type } from "typebox";
+import { Settings } from "typebox/system";
 import { describe, expect, it, vi } from "vitest";
 
 import { TemplateError } from "../../src/core/errors.js";
@@ -119,6 +120,21 @@ describe("llmNode", () => {
 		});
 	});
 
+	it("fails retryably when the closing fence is followed by trailing prose (fences are not swallowed)", async () => {
+		// 裁定口径：闭栅栏只在"剥过开栅栏且处于结尾"时剥；尾随说明文字留在正文里
+		// → JSON 解析失败 → 可重试（同 prompt 重发），而不是把说明文字也吞掉。
+		const text = `\`\`\`json\n${VALID_TEXT}\n\`\`\`\nHope this helps!`;
+
+		const error = await rejectionOf(
+			boundDef(fakeComplete(text).complete).handler(INPUT, makeCtx()),
+		);
+
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toContain("not valid JSON");
+		expect((error as Error).message).toContain("Hope this helps!");
+		expect(isRetryableError(error)).toBe(true);
+	});
+
 	it("marks JSON/schema failures retryable and throws a message carrying the schema error", async () => {
 		// JSON 解析失败：消息带解析原因与原文预览。
 		const jsonFail = await rejectionOf(
@@ -142,6 +158,55 @@ describe("llmNode", () => {
 		expect((schemaFail as Error).message).toContain("/answer");
 		expect((schemaFail as Error).message).toContain("must be string");
 		expect(isRetryableError(schemaFail)).toBe(true);
+	});
+
+	it("caps schema error details at three issues with a (+N more) suffix", async () => {
+		// 5 个字段全错 > MAX_SCHEMA_ISSUES（3）：消息只列前 3 条 + 余量计数（锁消息形状）。
+		const wide = Type.Object({
+			a: Type.String(),
+			b: Type.String(),
+			c: Type.String(),
+			d: Type.String(),
+			e: Type.String(),
+		});
+		const def = bindLlmNode(
+			llmNode<State, "reply">({
+				prompt: "p",
+				schema: wide,
+				writeTo: "reply",
+			}),
+			fakeComplete('{"a":1,"b":2,"c":3,"d":4,"e":5}').complete,
+		);
+
+		const error = await rejectionOf(def.handler(INPUT, makeCtx()));
+
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toContain("/a: must be string");
+		expect((error as Error).message).toMatch(/\(\+\d+ more\)/);
+		expect((error as Error).message).not.toContain("/d"); // 第 4 条起被截断
+		expect(isRetryableError(error)).toBe(true);
+	});
+
+	it("falls back to a plain rejection sentence when Check fails without error details", async () => {
+		// typebox 的诊断缓冲上限（Settings.maxErrors）为 0：Check 仍为假，而 Errors 返回空——
+		// 正是 llm.ts schemaErrorDetail 兜底句的分支（该函数模块私有，只能这样从外部到达）。
+		const previousMaxErrors = Settings.Get().maxErrors;
+		try {
+			Settings.Set({ maxErrors: 0 });
+			const def = boundDef(
+				fakeComplete('{"answer":42,"confidence":"high"}').complete,
+			);
+
+			const error = await rejectionOf(def.handler(INPUT, makeCtx()));
+
+			expect(error).toBeInstanceOf(Error);
+			expect((error as Error).message).toContain(
+				"value rejected by schema (no error details reported)",
+			);
+			expect(isRetryableError(error)).toBe(true);
+		} finally {
+			Settings.Set({ maxErrors: previousMaxErrors });
+		}
 	});
 
 	it("reports usage via ctx.reportUsage when complete returns usage", async () => {
@@ -257,7 +322,7 @@ describe("llmNode", () => {
 		});
 
 		expect(() => def.handler(INPUT, makeCtx())).toThrowError(
-			/llm node is not bound/,
+			"llm node is not bound: llm nodes are bound at compile time — compile the graph before running it",
 		);
 	});
 
@@ -280,9 +345,10 @@ describe("llmNode", () => {
 		});
 		expect(first).toHaveBeenCalledTimes(1);
 
-		// 重绑产出**新**定义（不改原件）：换一个 complete 覆盖。
+		// 重绑产出**新**定义（不改原件）：换一个 complete 覆盖；字段随拷贝保留。
 		const rebound = bindLlmNode(def, second);
 		expect(rebound).not.toBe(def);
+		expect(rebound.writeTo).toBe("reply");
 		expect(await rebound.handler(INPUT, makeCtx())).toEqual({
 			answer: "other",
 			confidence: 2,
