@@ -271,7 +271,7 @@ const { state, runId } = await app.run(initialState, {
 // 也有 langgraph 风格的 invoke() 别名——但注意 invoke() 返回 { state, runId } 而非裸 state，差异见 §12。
 ```
 
-> 日志**默认开启**（D2）：不配置也写 `<logDir ?? PI_WORKFLOW_LOG_DIR ?? ".pi-workflow/runs">/<YYYYMMDDTHHmmssSSSZ>-<runId>/run.jsonl`。关闭 = `services.logger: {}`（钩子全可选，空对象即全静默）；自定义实现 = `services.logger !== undefined`（原样使用）。注意 `onLogError` 默认 `"fail"`：默认目录不可写时每次 run 都以 `WorkflowError("run log write failed: …")` 拒绝（审计优先，刻意）；放宽用 `"warn"` 或关闭日志。
+> 日志**默认开启**（D2）：不配置也写 `<logDir || PI_WORKFLOW_LOG_DIR || ".pi-workflow/runs">/<YYYYMMDDTHHmmssSSSZ>-<runId>/run.jsonl`（空串视同未配置）。关闭 = `services.logger: {}`（钩子全可选，空对象即全静默）；自定义实现 = `services.logger !== undefined`（原样使用）。注意 `onLogError` 默认 `"fail"`：默认目录不可写时每次 run 都以 `WorkflowError("run log write failed: …")` 拒绝（审计优先，刻意）；放宽用 `"warn"` 或关闭日志。
 
 ### 4.5 标准 reducer（库导出）
 
@@ -463,7 +463,7 @@ for step in 0..:
 
 ### 8.1 事件与存储
 
-**启用日志的 run** 每次写一个 JSONL 文件：`<logDir ?? PI_WORKFLOW_LOG_DIR ?? ".pi-workflow/runs">/<YYYYMMDDTHHmmssSSSZ>-<runId>/run.jsonl`（**目录名不含冒号**，Windows 合法）：
+**启用日志的 run** 每次写一个 JSONL 文件：`<logDir || PI_WORKFLOW_LOG_DIR || ".pi-workflow/runs">/<YYYYMMDDTHHmmssSSSZ>-<runId>/run.jsonl`（**目录名不含冒号**，Windows 合法；空串视同未配置）：
 
 ```jsonl
 {"ts":"...","seq":1,"type":"run_started","runId":"...","graph":"contract-review","superstep":0,"input":{...}}

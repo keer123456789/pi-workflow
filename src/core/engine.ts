@@ -62,7 +62,7 @@
  *
  * run 日志接线（Task 3，D2/D7/D8，设计 §8）：
  * - **默认开启**：`services.logger !== undefined` → 原样使用（`{}` = 全静默）；否则每次 run
- *   用内置 JSONL 实现，目录 = `options.logDir ?? PI_WORKFLOW_LOG_DIR ?? ".pi-workflow/runs"`
+ *   用内置 JSONL 实现，目录 = `options.logDir || PI_WORKFLOW_LOG_DIR || ".pi-workflow/runs"`（空串回落）
  *   （env 覆盖**每次 run**解析）；
  * - **双路分发**（D7）：emitter 的 `transform` 做一次 hash 脱敏（`logOutputs: "hash"` 时），
  *   onEvent 与 logger 拿同一个事件对象；
@@ -145,7 +145,7 @@ const DEFAULT_MAX_TOTAL_INSTANCES = 10_000;
 const DEFAULT_MAX_CONCURRENCY = 8;
 
 /**
- * 默认日志目录（D2）：`options.logDir ?? PI_WORKFLOW_LOG_DIR ?? 此值`——**每次 run** 解析
+ * 默认日志目录（D2）：`options.logDir || PI_WORKFLOW_LOG_DIR || 此值`（空串视同未配置）——**每次 run** 解析
  * （不是 compile 期常量），测试 worker 里后设的环境变量因此也能生效。
  */
 const DEFAULT_LOG_DIR = ".pi-workflow/runs";

@@ -3,7 +3,7 @@
  *
  * 契约：
  * - **默认开启**（D2）：`services.logger !== undefined` → 原样使用（`{}` = 全静默）；
- *   否则内置 JSONL 实现，目录 = `options.logDir ?? PI_WORKFLOW_LOG_DIR ?? ".pi-workflow/runs"`
+ *   否则内置 JSONL 实现，目录 = `options.logDir || PI_WORKFLOW_LOG_DIR || ".pi-workflow/runs"`（空串回落）
  *   （**每次 run** 解析），文件 `<dir>/<时间戳>-<runId>/run.jsonl`；
  * - **双路同源**（D7/D9）：onEvent 与 logger 同序、同一个（脱敏后的）事件对象；
  *   `logOutputs: "hash"` 时三字段 → `"sha256:<64hex>"`，两路都见摘要；
