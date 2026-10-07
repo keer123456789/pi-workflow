@@ -66,14 +66,16 @@ function probePiAi(): boolean {
 		// 落到 ESM 条件兜底（见上）；老环境/打包器里 import.meta.resolve 可能没有 → false。
 	}
 	try {
+		// 返回值按 `unknown` 收：打包器/自定义 loader 的 shim 可能返回 Promise 之类的
+		// 非字符串——`!== undefined` 会把它们误判成"可用"，还会留下未处理的 rejection。
 		const resolve = (
 			import.meta as ImportMeta & {
-				resolve?: (specifier: string) => string;
+				resolve?: (specifier: string) => unknown;
 			}
 		).resolve;
-		return (
-			typeof resolve === "function" && resolve(PI_AI_PACKAGE) !== undefined
-		);
+		return typeof resolve === "function"
+			? typeof resolve(PI_AI_PACKAGE) === "string"
+			: false;
 	} catch {
 		return false;
 	}

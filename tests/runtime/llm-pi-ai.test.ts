@@ -284,6 +284,42 @@ describe("defaultPiAiComplete", () => {
 		expect((pending as Error).message).toContain("not supported");
 	});
 
+	it("treats 'toolUse' as a success and extracts the text", async () => {
+		// 白名单里的第三档（R1）：模型在无工具可用时仍回了 toolCall → 正文照常提取，
+		// "没有正文/正文不是 JSON"由 llm 节点的 JSON/schema 校验按可重试失败处理。
+		const content = [
+			{ type: "text", text: "partial " },
+			{ type: "toolCall", id: "call-1", name: "noop", arguments: {} },
+		];
+		mocks.getModel.mockReturnValue({});
+		mocks.completeSimple.mockResolvedValue(
+			assistantMessage({ content, stopReason: "toolUse" }),
+		);
+		mocks.contentText.mockReturnValue("partial ");
+
+		const result = await defaultPiAiComplete()(request());
+
+		expect(mocks.contentText).toHaveBeenCalledWith(content);
+		expect(result.text).toBe("partial ");
+	});
+
+	it("fails loudly on an unknown stopReason (future pi-ai values never guess success)", async () => {
+		mocks.getModel.mockReturnValue({});
+		mocks.completeSimple.mockResolvedValue(
+			assistantMessage({
+				content: [{ type: "text", text: '{"answer":"42"}' }], // 看着像成功也不行
+				stopReason: "weird",
+			}),
+		);
+
+		const error = await rejectionOf(defaultPiAiComplete()(request()));
+
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toContain("unsupported stopReason");
+		expect((error as Error).message).toContain("weird");
+		expect(mocks.contentText).not.toHaveBeenCalled();
+	});
+
 	it("throws a readable error for a missing '/' or unknown model", async () => {
 		const complete = defaultPiAiComplete();
 
