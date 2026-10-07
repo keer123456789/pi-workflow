@@ -17,7 +17,7 @@ import type { TSchema } from "typebox";
 
 import { executeRun, resolveServices } from "./engine.js";
 import { GraphSealedError, GraphValidationError } from "./errors.js";
-import type { StateSchema } from "./state.js";
+import { type StateSchema, stateKeyUniverse } from "./state.js";
 import {
 	type CompiledGraph,
 	type CompiledGraphData,
@@ -215,10 +215,11 @@ export class StateGraph<S extends object> {
 		}
 
 		// §6.5：非 fn 节点必须声明 writeTo；声明了 writeTo 就必须是已知的 State key
-		//（key 宇宙只来自 stateSchema，R14；未知则整条跳过）。
+		//（key 宇宙只来自 stateSchema，R14；未知则整条跳过——判定见 state.ts 的
+		// stateKeyUniverse，与 run 期的"未知 key"校验共用同一份实现）。
 		// （"schema 必须合法"一条在 M1 是真空的——NodeDefinition 还没有 schema 字段，
 		// llm/agent 工厂要到 M2 才落地；typebox 对象本身即 JSON Schema，无需额外校验。）
-		const universe = this.stateKeyUniverse();
+		const universe = stateKeyUniverse(this.stateSchema);
 		for (const [name, def] of this.nodes) {
 			if (def.writeTo === undefined) {
 				if (def.kind !== "fn") {
@@ -236,25 +237,6 @@ export class StateGraph<S extends object> {
 		}
 
 		return issues;
-	}
-
-	/**
-	 * 已知的 State key 宇宙（§6.5 的 writeTo 校验用，R14）：**只来自 `stateSchema`**，
-	 * 取其 `properties` 的 keys（typebox 对象 schema）。
-	 *
-	 * channels 不能当宇宙：`StateSchema<S>` 是 Partial 映射，只列"有自定义 reducer"的 key，
-	 * 而没有 reducer 的 key 合法可写（§5.1 直接覆盖写入）——拿 channels 当全集会把
-	 * `writeTo: "title"` + `channels: { logs: append }` 这类合法图判错。
-	 * 无 stateSchema（或它不是对象、给不出可枚举的 properties）→ undefined = 宇宙未知，
-	 * 跳过校验。非对象值（如 JS 调用方传的 `null`）也走这条路，绝不让裸 TypeError 逃出 compile。
-	 * 原则：宁可漏报，绝不误报。
-	 */
-	private stateKeyUniverse(): Set<string> | undefined {
-		if (!isRecord(this.stateSchema)) {
-			return undefined;
-		}
-		const properties = this.stateSchema.properties;
-		return isRecord(properties) ? new Set(Object.keys(properties)) : undefined;
 	}
 
 	/** compile 期警告（设计 §6.2/§6.3）：永不算错误，不会导致 throw（R4）。 */
@@ -305,11 +287,6 @@ export class StateGraph<S extends object> {
 
 		return warnings;
 	}
-}
-
-/** 非 null、非数组的对象（用于识别 typebox object schema 的 `properties`）。 */
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /** add-time 校验失败：单条 issue 也走 GraphValidationError（设计 §6.4）。 */

@@ -45,6 +45,11 @@ export class InvalidWriteError extends WorkflowError {
 
 /** 超步数超过 recursionLimit。 */
 export class GraphRecursionError extends WorkflowError {
+	/**
+	 * **被拒绝的"尝试超步"**（attempted superstep），不是已执行的超步数：
+	 * limit 内跑满后，下一次尝试的编号 = limit + 1（即 1 past the limit）。
+	 * 例：默认 limit 25 时自环图跑满 25 个超步后抛错，`superstep === 26`。
+	 */
 	superstep: number;
 	limit: number;
 

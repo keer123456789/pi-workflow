@@ -44,11 +44,18 @@ export type NodeDefinition<S, I = S> = {
 	timeoutMs?: number;
 };
 
-/** 条件边的返回值：节点名、END 或 Send（可数组形式一次给出多个目标）。 */
+/**
+ * 条件边的返回值：节点名、END 或 Send（可数组形式一次给出多个目标）。
+ * `null` / `undefined` 合法，语义同 END（设计 §4.2:183-184）；数组内的 null 项同样
+ * 只终止该项（运行期归一化在 engine.ts 的 normalizeRoute）。数组内项按本类型的
+ * 元素联合声明，null 项对 TS 调用方是运行期防御面（JS 调用方到得了）。
+ */
 export type RouterResult =
 	| typeof END
 	| string
 	| Send
+	| null
+	| undefined
 	| (typeof END | string | Send)[];
 
 /**
@@ -114,6 +121,10 @@ export type ResolvedServices = {
  * run 期事件流（设计 §8；Task 8 引入）。所有事件共享
  * `seq`（全局单调的 eventSeq）、`superstep`、`ts`（services.clock()）与 `runId`。
  * 顺序保证 = 完成序（实时性优先，§8.1）：需要全序的消费者用 seq 重排。
+ *
+ * committed 边界语义（T10）：**不做**逐事件打标（§8.1 样例的 `committed:false` 在 M1
+ * 不落字段）。某超步是否提交看它的事件之后跟随的边界事件——`superstep_committed`
+ * 已提交 / `superstep_aborted` 未提交（含失败超步）；消费方按最近边界判定。
  */
 export type RunEvent =
 	| {

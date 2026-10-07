@@ -7,7 +7,8 @@
  * - 提交按全局实例序（instanceId = `name#seq`）升序折叠，与完成顺序无关；
  * - 事件按完成序发出，eventSeq 全局严格递增；superstep 单调不减；
  * - 超步数超过 recursionLimit（默认 25）→ GraphRecursionError（自环测试 limit=3）；
- * - handler 抛错 = fail-fast：node_failed → run_finished(failed) → NodeExecutionError。
+ * - handler 抛错 = fail-fast：node_failed → superstep_aborted → run_finished(failed)
+ *   → NodeExecutionError（superstep_aborted 是 T10 补的失败超步边界）。
  *
  * 本任务不含 router/Send/预算/取消/重试（T9–T12）。
  */
@@ -408,10 +409,12 @@ describe("engine: event stream (设计 §8)", () => {
 		// 本任务没有重试/取消，没有连带实例
 		expect(nodeError.collateral).toEqual([]);
 
+		// T10 起：失败超步以 superstep_aborted 收尾（committed 边界语义，§8.1）
 		expect(events.map((e) => e.type)).toEqual([
 			"run_started",
 			"node_started",
 			"node_failed",
+			"superstep_aborted",
 			"run_finished",
 		]);
 		expect(ofType(events, "node_failed")[0]).toMatchObject({

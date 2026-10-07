@@ -1,11 +1,14 @@
 /**
- * channel / reducer 与状态折叠（leaf 模块：除 InvalidWriteError 外无任何 import、无 I/O）。
+ * channel / reducer 与状态折叠（leaf 模块：除 InvalidWriteError 与 type-only 的
+ * `TSchema` 外无任何 import、无 I/O）。
  *
  * 职责边界（R7）：
  * - 标准 reducer 是纯函数，检测到非法写入时抛普通 `Error`（它们不持有 writer 信息，
  *   不构造 InvalidWriteError）；
  * - `foldUpdates` 是唯一把 reducer 错误统一包装成 `InvalidWriteError` 的地方（保留 cause）。
  */
+
+import type { TSchema } from "typebox";
 
 import { InvalidWriteError } from "./errors.js";
 
@@ -118,6 +121,30 @@ export function foldUpdates<S extends object>(
 	}
 
 	return next;
+}
+
+/**
+ * 已知的 State key 宇宙：`stateSchema` 的可枚举 `properties` keys（typebox 对象
+ * schema）。compile 期的 writeTo 校验（§6.5/R14）与 run 期的"节点返回未知 key"
+ * 校验（§6.7/T10）共用这一判定——两处必须语义一致，故只有这一份实现。
+ *
+ * 无法枚举时（未提供 / 非对象 / 没有 properties）→ `undefined` = 宇宙未知 →
+ * 调用方跳过校验：宁可漏报，绝不误报。`channels` 永不作宇宙（`StateSchema<S>` 是
+ * Partial 映射，只列有 reducer 的 key，无 reducer 的 key 合法可写）。
+ */
+export function stateKeyUniverse(
+	schema: TSchema | undefined,
+): Set<string> | undefined {
+	if (!isRecord(schema)) {
+		return undefined;
+	}
+	const properties = schema.properties;
+	return isRecord(properties) ? new Set(Object.keys(properties)) : undefined;
+}
+
+/** 非 null、非数组的对象（识别 typebox object schema 的 `properties`）。 */
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /** 错误消息里对任意值的简短描述：不展开对象，避免循环引用与超长输出。 */

@@ -22,6 +22,7 @@ import { append } from "../../src/core/state.js";
 import {
 	END,
 	type Router,
+	type RouterResult,
 	type RunEvent,
 	type RunOptions,
 	type RunResult,
@@ -201,6 +202,7 @@ describe("engine: router activation (设计 §5.4)", () => {
 		type S = { log: string[] };
 		const zInputs: S[] = [];
 		const zIds: string[] = [];
+		const wInputs: S[] = [];
 		let wRuns = 0;
 
 		const g = new StateGraph<S>({ channels: { log: append } })
@@ -224,8 +226,9 @@ describe("engine: router activation (设计 §5.4)", () => {
 			)
 			.addNode(
 				"w",
-				fnNode<S>(() => {
+				fnNode<S>((input) => {
 					wRuns += 1;
+					wInputs.push(input as S);
 					return { log: ["w"] };
 				}),
 			)
@@ -241,8 +244,9 @@ describe("engine: router activation (设计 §5.4)", () => {
 		expect(zIds).toEqual(["z#3"]);
 		// 普通触发的输入 = 提交后 state 的只读快照
 		expect(zInputs[0].log).toEqual(["a", "b"]);
-		// router 触达的 w 照常激活
+		// router 触达的 w 照常激活，输入同样是提交后 state 的只读快照（合并后、含 a 与 b 的写入）
 		expect(wRuns).toBe(1);
+		expect(wInputs[0].log).toEqual(["a", "b"]);
 		expect(state.log).toEqual(["a", "b", "z", "w"]);
 	});
 
@@ -289,7 +293,8 @@ describe("engine: router activation (设计 §5.4)", () => {
 
 	it("treats null / undefined / [] / END results as END (branch terminates, run completes)", async () => {
 		type S = { ran?: number };
-		const results: unknown[] = [null, undefined, [], END];
+		// RouterResult 已含 null/undefined（设计 §4.2:183-184，T10 补类型），无需 cast
+		const results: RouterResult[] = [null, undefined, [], END];
 
 		for (const result of results) {
 			let targetRuns = 0;
@@ -299,12 +304,10 @@ describe("engine: router activation (设计 §5.4)", () => {
 					"a",
 					fnNode<S>(() => ({ ran: 1 })),
 				)
-				// RouterResult 类型（Task 5 冻结）不含 null/undefined，而设计 §4.2 声明
-				// 二者合法——JS 调用方与 `as` 之后的 TS 调用方都走运行期归一化。
-				.addConditionalEdges("a", (() => {
+				.addConditionalEdges("a", () => {
 					routerCalls += 1;
 					return result;
-				}) as unknown as Router<S>)
+				})
 				.addNode(
 					"target",
 					fnNode<S>(() => {
@@ -449,6 +452,7 @@ describe("engine: router evaluation (设计 §4.2/§5.1)", () => {
 	it("passes lastUpdate = the node's own writes only ({} when it wrote nothing)", async () => {
 		type S = { log: string[] };
 		const seen: { state: S; lastUpdate: Partial<S> }[] = [];
+		let emptyLastUpdate: Partial<S> | undefined;
 
 		const g = new StateGraph<S>({ channels: { log: append } })
 			.addNode(
@@ -459,12 +463,22 @@ describe("engine: router evaluation (设计 §4.2/§5.1)", () => {
 				"b",
 				fnNode<S>(() => ({ log: ["b"] })),
 			)
+			.addNode(
+				// c 什么都不写：它的 lastUpdate 恰好是空对象
+				"c",
+				fnNode<S>(() => ({})),
+			)
 			.addConditionalEdges("a", (state, lastUpdate) => {
 				seen.push({ state, lastUpdate });
 				return END;
 			})
+			.addConditionalEdges("c", (_state, lastUpdate) => {
+				emptyLastUpdate = lastUpdate;
+				return END;
+			})
 			.addEdge(START, "a")
 			.addEdge(START, "b")
+			.addEdge(START, "c")
 			.addEdge("b", END);
 
 		await run(g, { log: [] });
@@ -475,6 +489,9 @@ describe("engine: router evaluation (设计 §4.2/§5.1)", () => {
 		// 第二参数：只含 a 自己的写入（不含 b 的）
 		expect(seen[0].lastUpdate).toEqual({ log: ["a"] });
 		expect(Object.keys(seen[0].lastUpdate)).toEqual(["log"]);
+		// 一个字都没写的节点：lastUpdate 严格等于 {}（不是 undefined、不是累积 state）
+		expect(emptyLastUpdate).toEqual({});
+		expect(Object.keys(emptyLastUpdate ?? {})).toEqual([]);
 	});
 
 	it("folds the node's own instances by seq order into lastUpdate (Send fan-in)", async () => {
