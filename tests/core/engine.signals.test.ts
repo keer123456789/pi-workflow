@@ -90,23 +90,34 @@ function tick(): Promise<void> {
 
 /**
  * 受控 sleep：记录请求时长，由测试显式 `flush(ms)` 放行（`auto: true` 则到达即放行）。
+ * 返回值与默认 sleep 同形（非枚举 `cancel()`，R20）——引擎的能力探测路径由此覆盖。
  * 没有任何真实计时器——超时/退避的时序完全由测试掌握。
  */
 function fakeSleep(opts?: { auto?: boolean }): {
 	sleep: (ms: number) => Promise<void>;
 	requested: number[];
+	/** 被引擎 cancel 掉的睡眠句柄（R20）：证明引擎不持有已结束的定时器。 */
+	cancelled: number[];
 	flush: (ms?: number) => void;
 } {
 	const requested: number[] = [];
+	const cancelled: number[] = [];
 	const pending: { ms: number; resolve: () => void }[] = [];
 	const sleep = (ms: number): Promise<void> => {
 		requested.push(ms);
-		if (opts?.auto === true) {
-			return Promise.resolve();
-		}
-		return new Promise<void>((resolve) => {
-			pending.push({ ms, resolve });
+		const promise: Promise<void> =
+			opts?.auto === true
+				? Promise.resolve()
+				: new Promise<void>((resolve) => {
+						pending.push({ ms, resolve });
+					});
+		Object.defineProperty(promise, "cancel", {
+			value: () => {
+				cancelled.push(ms);
+			},
+			enumerable: false,
 		});
+		return promise;
 	};
 	/** 放行指定时长的待决 sleep（省略 ms = 全部放行）。 */
 	const flush = (ms?: number): void => {
@@ -119,7 +130,7 @@ function fakeSleep(opts?: { auto?: boolean }): {
 			item.resolve();
 		}
 	};
-	return { sleep, requested, flush };
+	return { sleep, requested, cancelled, flush };
 }
 
 /** 节点被取消时的标准 rejection（AbortError 形态，DOMException / Error 皆可）。 */
@@ -272,6 +283,93 @@ describe("fail-fast cancellation and collateral (设计 §7.1/§7.4)", () => {
 		expect(bStats.aborts).toBe(1);
 		expect(cStats.aborts).toBe(1);
 		expect(ofType(events, "node_failed").map((e) => e.node)).toEqual(["a"]);
+	});
+
+	it("classifies a plain-error failure of a cancelled sibling as collateral, not as root (R20a)", async () => {
+		const events: RunEvent[] = [];
+		const boom = new Error("b blew up");
+		const started = deferred();
+		const aRuns: { count: number } = { count: 0 };
+
+		// a 被取消后 reject 的是**普通 Error**（ECONNRESET 这类真实瞬态错误，不是 AbortError）：
+		// R20a 的判定与错误形状无关——它仍是 collateral，不得当根因。
+		const g = parallel(
+			configuredFn({
+				maxAttempts: 1,
+				handler: async (_input, ctx) => {
+					aRuns.count += 1;
+					started.resolve();
+					return await new Promise<Partial<S>>((_resolve, reject) => {
+						ctx.signal.addEventListener(
+							"abort",
+							() => {
+								reject(new Error("ECONNRESET"));
+							},
+							{ once: true },
+						);
+					});
+				},
+			}),
+			fnNode<S>(() => {
+				throw boom;
+			}),
+		);
+
+		const error = await captureRejection(
+			run(g, {}, { onEvent: (e) => events.push(e) }),
+		);
+
+		await started.promise;
+		expect(error).toBeInstanceOf(NodeExecutionError);
+		const nodeError = error as NodeExecutionError;
+		// 根因 = 真正确认过的失败（b#2），不是被取消时才抛错的 a#1
+		expect(nodeError.node).toBe("b");
+		expect(nodeError.instanceId).toBe("b#2");
+		expect(nodeError.cause).toBe(boom);
+		expect(nodeError.collateral).toEqual(["a#1"]);
+		expect(ofType(events, "node_failed").map((e) => e.node)).toEqual(["b"]);
+		expect(aRuns.count).toBe(1);
+	});
+
+	it("emits no node_retry for a cancelled instance that fails with a plain error (R20a)", async () => {
+		const events: RunEvent[] = [];
+		const boom = new Error("b blew up");
+		const started = deferred();
+		let aRuns = 0;
+
+		// 取消后到达的普通错误也不得产生"幻觉 node_retry"（重试根本不会发生）。
+		const g = parallel(
+			configuredFn({
+				maxAttempts: 3,
+				handler: async (_input, ctx) => {
+					aRuns += 1;
+					started.resolve();
+					return await new Promise<Partial<S>>((_resolve, reject) => {
+						ctx.signal.addEventListener(
+							"abort",
+							() => {
+								reject(new Error("client canceled"));
+							},
+							{ once: true },
+						);
+					});
+				},
+			}),
+			fnNode<S>(() => {
+				throw boom;
+			}),
+		);
+
+		const error = await captureRejection(
+			run(g, {}, { onEvent: (e) => events.push(e) }),
+		);
+
+		await started.promise;
+		expect(aRuns).toBe(1); // 取消不重试
+		expect(ofType(events, "node_retry")).toHaveLength(0);
+		expect(ofType(events, "node_failed").map((e) => e.node)).toEqual(["b"]);
+		expect(error).toBeInstanceOf(NodeExecutionError);
+		expect((error as NodeExecutionError).collateral).toEqual(["a#1"]);
 	});
 
 	it("does not list an already-completed sibling as collateral (its result is discarded)", async () => {
@@ -451,6 +549,30 @@ describe("run-level cancellation (设计 §4.4/§7.4)", () => {
 			superstep: 1,
 		});
 		expect(ofType(events, "superstep_aborted")).toHaveLength(1);
+	});
+
+	it("cancels the run-level deadline handle when the run finishes (R20)", async () => {
+		const clock = fakeSleep();
+
+		const g = new StateGraph<S>()
+			.addNode(
+				"a",
+				fnNode<S>(() => ({ v: 1 })),
+			)
+			.addEdge(START, "a")
+			.addEdge("a", END);
+
+		const { state } = await run(
+			g,
+			{},
+			{ runTimeoutMs: 600_000 },
+			{ services: { sleep: clock.sleep } },
+		);
+
+		expect(state.v).toBe(1);
+		expect(clock.requested).toEqual([600_000]);
+		// run 正常结束 → 未到期的 run 级定时器被清掉：没有引擎持有的挂起计时器
+		expect(clock.cancelled).toEqual([600_000]);
 	});
 
 	it("fn handler receives ctx.signal; RunHandle.cancel() aborts the run (idempotent, post-settle no-op)", async () => {
@@ -681,6 +803,8 @@ describe("retry with backoff (设计 §7.2)", () => {
 		expect(runs).toBe(1); // 不再重试
 		expect(ofType(events, "node_retry")).toHaveLength(1); // 第一次失败时已发
 		expect(ofType(events, "node_failed")).toHaveLength(0); // 取消不是失败
+		// R20：取消赢得竞速 → 这个不再被等待的退避定时器被清掉
+		expect(clock.cancelled).toEqual([250]);
 	});
 });
 
@@ -769,6 +893,66 @@ describe("attempt timeouts (设计 §7.3/§7.4)", () => {
 		expect(signals[1].aborted).toBe(false);
 		expect(ofType(events, "node_retry")).toHaveLength(1);
 		expect(ofType(events, "node_finished")).toHaveLength(1);
+	});
+
+	it("cancels the attempt deadline handle when the attempt settles first (R20)", async () => {
+		const clock = fakeSleep();
+
+		const g = new StateGraph<S>()
+			.addNode(
+				"fast",
+				configuredFn({
+					timeoutMs: 100,
+					handler: () => ({ v: 1 }),
+				}),
+			)
+			.addEdge(START, "fast")
+			.addEdge("fast", END);
+
+		const { state } = await run(
+			g,
+			{},
+			{},
+			{ services: { sleep: clock.sleep } },
+		);
+
+		expect(state.v).toBe(1);
+		expect(clock.requested).toEqual([100]); // 超时定时器已武装
+		expect(clock.cancelled).toEqual([100]); // 尝试先 settle → 定时器被清掉（不留悬挂计时器）
+	});
+
+	it("tolerates injected sleeps without cancel (capability detection, R20)", async () => {
+		const events: RunEvent[] = [];
+		let runs = 0;
+
+		const g = new StateGraph<S>()
+			.addNode(
+				"flaky",
+				configuredFn({
+					maxAttempts: 2,
+					handler: () => {
+						runs += 1;
+						if (runs === 1) {
+							throw new Error("transient");
+						}
+						return { v: runs };
+					},
+				}),
+			)
+			.addEdge(START, "flaky")
+			.addEdge("flaky", END);
+
+		// 普通注入 sleep（没有 cancel 方法）：能力探测必须放过它，重试照常
+		const { state } = await run(
+			g,
+			{},
+			{ onEvent: (e) => events.push(e) },
+			{ services: { sleep: () => Promise.resolve(), random: () => 0.5 } },
+		);
+
+		expect(state.v).toBe(2);
+		expect(runs).toBe(2);
+		expect(ofType(events, "node_retry")).toHaveLength(1);
 	});
 
 	it("does not leak an unhandled rejection when an abandoned attempt rejects later", async () => {

@@ -96,6 +96,7 @@ import {
 	type RunOptions,
 	type RunResult,
 	type Services,
+	type SleepResult,
 	START,
 } from "./types.js";
 
@@ -124,15 +125,47 @@ type InstanceResult<S extends object> = {
 	update: Partial<S>;
 };
 
-/** compile 期把可选 services 归一为必填，缺省 Date.now / setTimeout / Math.random（R3）。 */
+/** compile 期把可选 services 归一为必填，缺省 Date.now / 可取消的 setTimeout / Math.random（R3/R20）。 */
 export function resolveServices(services?: Services): ResolvedServices {
 	return {
 		clock: services?.clock ?? Date.now,
-		sleep:
-			services?.sleep ??
-			((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))),
+		sleep: services?.sleep ?? defaultSleep,
 		random: services?.random ?? Math.random,
 	};
+}
+
+/**
+ * 默认 sleep（R3）：真实 setTimeout，返回值额外带一个非枚举的 `cancel()`
+ * 清掉未到期的定时器（R20）。
+ *
+ * 计时器**保持 ref'd**：退避是"进度等待"，unref 会让单节点重试的 run 在退避期间
+ * 直接没有活着的句柄、进程提前退出。取消只发生在"引擎已不再等待"之后（竞速分出胜负、
+ * run 结束），因此不影响等待语义。
+ */
+function defaultSleep(ms: number): SleepResult {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const promise = new Promise<void>((resolve) => {
+		timer = setTimeout(resolve, ms);
+	});
+	Object.defineProperty(promise, "cancel", {
+		value: () => {
+			if (timer !== undefined) {
+				clearTimeout(timer);
+			}
+		},
+		enumerable: false,
+	});
+	return promise;
+}
+
+/**
+ * 取消一个睡眠句柄（R20，能力探测）：默认 sleep 带 `cancel()`；注入的 sleep 没有就跳过
+ * ——`(ms) => Promise<void>` 的公开契约不受影响。只对**已不再等待**的句柄调用。
+ */
+function cancelSleep(sleepResult: SleepResult): void {
+	if (typeof sleepResult.cancel === "function") {
+		sleepResult.cancel();
+	}
 }
 
 /**
@@ -148,7 +181,7 @@ export function executeRun<S extends object>(
 ): RunHandle<S> {
 	const runController = new AbortController();
 	// run 级资源的归置点（见 RunScope）：run 本体 settle 后由 handle 统一触发。
-	const runScope: RunScope = { finished: false, dispose: () => {} };
+	const runScope: RunScope = { finished: false, cleanups: [] };
 	const promise = runGraph(
 		graph,
 		initial,
@@ -159,20 +192,25 @@ export function executeRun<S extends object>(
 	);
 	return toRunHandle(promise, runController, () => {
 		runScope.finished = true;
-		runScope.dispose();
+		for (const cleanup of runScope.cleanups) {
+			cleanup();
+		}
 	});
 }
 
 /**
- * run 级资源的清理开关（T11）：run 取消/超时都建立在"run 还没结束"这个前提上，而"结束"
- * 只有 async 本体 settle 才知道——由 executeRun 在 promise settle 时统一触发，避免在
- * 每个退出路径（正常返回 / 各类 throw）上各写一遍清理。
+ * run 级资源的清理开关（T11/R20）：run 取消/超时都建立在"run 还没结束"这个前提上，而
+ * "结束"只有 async 本体 settle 才知道——由 executeRun 在 promise settle 时统一触发，
+ * 避免在每个退出路径（正常返回 / 各类 throw）上各写一遍清理。
  */
 type RunScope = {
 	/** run 本体已结束：之后到点的 run 级定时器与外部 signal 都不再 abort。 */
 	finished: boolean;
-	/** 摘除 run 级监听（外部 signal 可能被调用方复用到下一个 run）。 */
-	dispose: () => void;
+	/**
+	 * run settle 时执行的清理（按注册序）：摘除外部 signal 监听（调用方可能复用该 signal）、
+	 * 清掉未到期的 run 级定时器（R20——run 结束后没有引擎持有的计时器）。
+	 */
+	cleanups: (() => void)[];
 };
 
 /**
@@ -258,9 +296,9 @@ async function runGraph<S extends object>(
 			runController.abort(error);
 		};
 		externalSignal.addEventListener("abort", onExternalAbort);
-		runScope.dispose = () => {
+		runScope.cleanups.push(() => {
 			externalSignal.removeEventListener("abort", onExternalAbort);
-		};
+		});
 	}
 
 	// run 级超时（§7.3/§4.4）：到期 abort run signal。非有限 / <= 0 视为"无超时"
@@ -271,7 +309,8 @@ async function runGraph<S extends object>(
 		Number.isFinite(runTimeoutMs) &&
 		runTimeoutMs > 0
 	) {
-		void services.sleep(runTimeoutMs).then(
+		const deadline = services.sleep(runTimeoutMs);
+		void deadline.then(
 			() => {
 				if (!runScope.finished) {
 					runController.abort(
@@ -281,6 +320,10 @@ async function runGraph<S extends object>(
 			},
 			() => {},
 		);
+		// R20：run 结束即清掉未到期的 run 级定时器（默认实现提供 cancel；注入的没有就跳过）
+		runScope.cleanups.push(() => {
+			cancelSleep(deadline);
+		});
 	}
 
 	let state: S = initial;
@@ -731,10 +774,13 @@ async function executeInstance<S extends object>(args: {
 		}
 
 		const cause = outcome.error;
-		// 取消不是失败（§7.4）：实例信号已取消，且错误由该取消引起（AbortError / signal.reason）
-		// → 不重试、不发 node_failed，交给调用方记进 collateral。节点自身内部的 AbortError
-		// （如嵌套请求超时）不算取消，仍按可重试失败处理（§7.2 的 timeout 类）。
-		if (instanceSignal.aborted && causedByCancellation(cause, attemptSignal)) {
+		// 取消不是失败（§7.4，R20a）：实例信号已取消时，**任何**尝试失败都算"被取消"——
+		// 判定与错误形状无关（被取消的节点可能 reject AbortError / `signal.reason`，也可能
+		// reject ECONNRESET、客户端 CanceledError 这类 §7.2 的真实瞬态错误）。不发
+		// node_failed、不重试，交给调用方记进 collateral，也不参与根因选举（T10 的实例序
+		// 选举只在"未被取消"的失败之间进行）。节点自身内部的 AbortError（嵌套请求超时）
+		// 不受影响：实例信号没有取消，它仍是可重试失败（§7.2 的 timeout 类）。
+		if (instanceSignal.aborted) {
 			throw new InstanceCancelledError(instance.instanceId);
 		}
 		if (attempt >= maxAttempts) {
@@ -743,6 +789,8 @@ async function executeInstance<S extends object>(args: {
 		}
 
 		// 重试（§7.2）：发 node_retry（attempt = 刚失败的那次尝试编号），退避后进入下一次尝试。
+		// 上一行的取消判定与这里之间没有 await：node_retry 永远对应一次**真会发生的**重试，
+		// 不会出现"发了重试事件却被取消"的幻觉条目（R20a 的回归点）。
 		emitter.emit({
 			type: "node_retry",
 			superstep,
@@ -782,25 +830,6 @@ class InstanceCancelledError extends Error {
 }
 
 /**
- * 失败是否由信号取消引起（§7.4 的"取消 vs 失败"判定）：AbortError 形态，或节点直接
- * reject 了 `signal.reason` 本体。调用方还要求 instance signal 已取消——这样节点自身
- * 内部产生的 AbortError（嵌套请求超时等）不会被误判成取消。
- */
-function causedByCancellation(
-	error: unknown,
-	attemptSignal: AbortSignal,
-): boolean {
-	if (
-		typeof error === "object" &&
-		error !== null &&
-		(error as { name?: unknown }).name === "AbortError"
-	) {
-		return true;
-	}
-	return error === attemptSignal.reason;
-}
-
-/**
  * 单次尝试的判定：handler 的 settle 与超时二者抢先（§7.3/§7.4）。
  *
  * - 超时 = 本尝试失败（可重试），并被**统一渲染**成 `makeTimeoutError()`——即使 handler
@@ -833,8 +862,9 @@ async function raceAttempt(args: {
 		armed: true,
 		error: undefined,
 	};
+	const deadline = args.sleep(timeoutMs);
 	const timeoutOutcome = new Promise<AttemptOutcome>((resolve) => {
-		void args.sleep(timeoutMs).then(
+		void deadline.then(
 			() => {
 				if (!timer.armed) {
 					return; // 尝试已结束：本分支不参与竞争（也不 abort 任何东西）
@@ -850,6 +880,8 @@ async function raceAttempt(args: {
 	});
 	const outcome = await Promise.race([handlerOutcome, timeoutOutcome]);
 	timer.armed = false;
+	// R20：竞速已分出胜负——这个不再被等待的超时定时器清掉（`cancel` 可选，能力探测）。
+	cancelSleep(deadline);
 	return timer.error !== undefined
 		? { status: "failed", error: timer.error }
 		: outcome;
@@ -860,21 +892,24 @@ type AttemptOutcome =
 	| { status: "failed"; error: unknown };
 
 /**
- * 等待 `promise`，但信号取消时立即返回——退避 sleep 因此可被打断，取消不必等满退避窗口。
+ * 等待 `sleepResult`，但信号取消时立即返回——退避 sleep 因此可被打断，取消不必等满退避窗口。
  * rejection 原样传播（调用方按"退避服务故障 = 节点失败"处理）；信号监听器在结束时摘除
  * （多次重试不会在同一个信号上累积监听器）。
+ * R20：竞速结束时把退避句柄清掉（睡着完成 / 被取消打断两种情况下它都已不再被等待）；
+ * 等待期间定时器保持 ref'd——退避是进度等待，进程不得在退避中途退出。
  */
 async function raceWithAbort(
-	promise: Promise<void>,
+	sleepResult: SleepResult,
 	signal: AbortSignal,
 ): Promise<void> {
 	if (signal.aborted) {
+		cancelSleep(sleepResult);
 		return;
 	}
 	let onAbort: (() => void) | undefined;
 	try {
 		await Promise.race([
-			promise,
+			sleepResult,
 			new Promise<void>((resolve) => {
 				onAbort = () => resolve();
 				signal.addEventListener("abort", onAbort, { once: true });
@@ -884,6 +919,7 @@ async function raceWithAbort(
 		if (onAbort !== undefined) {
 			signal.removeEventListener("abort", onAbort);
 		}
+		cancelSleep(sleepResult);
 	}
 }
 

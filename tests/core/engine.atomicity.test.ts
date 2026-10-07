@@ -231,7 +231,7 @@ describe("superstep atomicity: failed superstep (设计 §5.1:323-325)", () => {
 		expect(ofType(events, "superstep_committed")).toHaveLength(0);
 	});
 
-	it("rethrows the lowest-instanceSeq failure even when another instance fails first", async () => {
+	it("rethrows the failure that triggered the cancellation; a lower-seq sibling failing after its own abort is collateral (R20a)", async () => {
 		const events: RunEvent[] = [];
 		const aBoom = new Error("a boom");
 		let releaseA: () => void = () => {};
@@ -250,7 +250,7 @@ describe("superstep atomicity: failed superstep (设计 §5.1:323-325)", () => {
 			.addNode(
 				"b",
 				fnNode<BasicState>(() => {
-					releaseA(); // b 先失败（完成序上 node_failed 先发）
+					releaseA(); // b 先失败（完成序上 node_failed 先发），并 fail-fast 取消 a
 					throw new Error("b boom");
 				}),
 			)
@@ -263,15 +263,16 @@ describe("superstep atomicity: failed superstep (设计 §5.1:323-325)", () => {
 			run(g, {}, { onEvent: (e) => events.push(e) }),
 		);
 
-		// 完成序里 b 先失败……
-		expect(ofType(events, "node_failed").map((e) => e.node)).toEqual([
-			"b",
-			"a",
-		]);
-		// ……但重抛的是实例序最小的 a#1（确定性，与调度无关）
+		// b 先失败并取消 a（a 的信号在它抛出 aBoom 之前就已 abort）：
+		// 按 R20a，取消后到达的失败一律是"被取消"（判定与错误形状无关），进 collateral，
+		// 不与根因竞争——根因是 b#2（唯一真正确认过的失败），a 不发光 node_failed。
+		expect(ofType(events, "node_failed").map((e) => e.node)).toEqual(["b"]);
 		expect(error).toBeInstanceOf(NodeExecutionError);
-		expect((error as NodeExecutionError).instanceId).toBe("a#1");
-		expect((error as NodeExecutionError).cause).toBe(aBoom);
+		const nodeError = error as NodeExecutionError;
+		expect(nodeError.instanceId).toBe("b#2");
+		expect((nodeError.cause as Error).message).toBe("b boom");
+		expect(nodeError.collateral).toEqual(["a#1"]);
+		expect(aBoom.message).toBe("a boom"); // a 的原始错误只作废，不进入根因
 		// 两个失败落在同一个 aborted 边界内
 		expect(ofType(events, "superstep_aborted")).toHaveLength(1);
 	});

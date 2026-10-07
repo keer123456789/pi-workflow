@@ -262,6 +262,8 @@ const { state, runId } = await app.run(initialState, {
 // run()/invoke() 返回 RunHandle<S> = Promise<{ state, runId }> & { cancel(): void }：
 // 对运行中的 handle 调 cancel() 即中止本次 run（abort run signal，§7.4 的 run 级取消），
 // 幂等且 run 已 settle 后是 no-op；拒绝体是 WorkflowError("run cancelled")。
+// 已经 abort 的 signal 传入时**先于初始 state 校验**拒绝（一个事件都不发）——刻意的顺序：
+// 取消是调用方更强的意图表达，调用方不要把它误读成 GraphValidationError。
 // 也有 langgraph 风格的 invoke() 别名——但注意 invoke() 返回 { state, runId } 而非裸 state，差异见 §12。
 ```
 
@@ -289,7 +291,9 @@ type CompileOptions = {
     complete?: CompleteFn;                // llm 节点默认补全实现；缺省用 pi-ai 适配器
     logger?: RunLogger;                   // 默认 JSONL 实现（§8）
     clock?: () => number;                 // 可注入时钟/睡眠/随机——重试退避可测试
-    sleep?: (ms: number) => Promise<void>;
+    sleep?: (ms: number) => Promise<void>; // 契约不变；默认实现额外带非枚举 cancel()（R20）——
+                                           // 引擎只做能力探测：竞速结束/run 结束时清掉已不再等待的
+                                           // 定时器。等待期间保持 ref'd（退避是进度等待，不得 unref）
     random?: () => number;
   };
 };
@@ -423,7 +427,7 @@ for step in 0..:
 
 - 分类标准沿用 forge 的正则族：429 / 408 / 5xx / rate limit / timeout / ECONNRESET / socket hang up；llm 输出不符合 schema 同样可重试（同 prompt 重发）；
 - `retry.maxAttempts`：**总尝试次数**（含首次），默认 1（不重试）；
-- 退避：指数 base 500ms，上限 30s，full jitter（`sleep(base * 2^attempt * random())`，上限截断）；`clock` / `sleep` / `random` 均可注入（§4.6），重试时序可测试。
+- 退避：指数 base 500ms，上限 30s，full jitter（`sleep(min(base * 2^已重试次数 * random(), 30s))`，**指数用已重试次数，0 起**——首次重试的基数即 base 500ms；上限截断）；`clock` / `sleep` / `random` 均可注入（§4.6），重试时序可测试；
 
 ### 7.3 超时
 
@@ -440,6 +444,7 @@ for step in 0..:
 | attempt signal | 从 instance signal 派生，每次重试新建 | 单次尝试的超时控制；本尝试失败不影响后续尝试 |
 
 约定：**所有节点（含 fn）必须尊重 `ctx.signal`**（长循环里周期性检查）；引擎无法抢占不检查信号的 fn，文档显式说明。fn 的 `timeoutMs` 到期只能触发信号，靠节点自身响应——引擎只保证自己不再等它：超时的尝试按"handler settle vs 计时器"竞速判定，超时分支胜出即判失败（可重试），被放弃的 handler 若仍在跑属于节点自身失控，其 promise 已被引擎接管（reject 不会变成 unhandled rejection）。
+节点收到 abort 后**应当**以 AbortError（或直接 reject `ctx.signal.reason`）退出，但引擎**不再依赖错误的形状**（R20a）：实例信号已取消时，任何尝试失败都归"被取消"（进 `collateral`，不重试、不参与根因选举）——被取消的节点 reject `ECONNRESET`、客户端 `CanceledError` 这类真实瞬态错误同样如此。
 
 ### 7.5 运行期路由错误
 
@@ -456,14 +461,14 @@ for step in 0..:
 ```jsonl
 {"ts":"...","seq":0,"type":"run_started","runId":"...","graph":"contract-review","superstep":0,"input":{...}}
 {"ts":"...","seq":3,"type":"node_started","runId":"...","superstep":2,"node":"review","instanceId":"review#7","seq":7,"kind":"llm","input":{...}}
-{"ts":"...","seq":8,"superstep":2,"type":"node_retry","runId":"...","node":"review","instanceId":"review#7","attempt":2,"error":"429 rate limit"}
+{"ts":"...","seq":8,"superstep":2,"type":"node_retry","runId":"...","node":"review","instanceId":"review#7","attempt":1,"error":"429 rate limit"}
 {"ts":"...","seq":9,"type":"node_finished","runId":"...","superstep":2,"instanceId":"review#7","output":{...},"usage":{"tokens":1234},"durationMs":4200}
 {"ts":"...","seq":12,"type":"superstep_committed","runId":"...","superstep":2}
 {"ts":"...","type":"run_finished","runId":"...","status":"completed|failed","durationMs":...}
 ```
 
 - **所有事件带 `seq` 与 `superstep`**；失败超步的事件打标 `committed:false`，并追加 `superstep_aborted` 事件——事件溯源重放（v2）只重放 committed 超步；
-- `node_retry`（每次重试前一条）字段 = 样例的 `node` / `instanceId` / `attempt` / `error`；`attempt` 是**刚失败的那次尝试**编号（1 起），`error` 是失败错误的消息文本；
+- `node_retry`（每次重试前一条）字段 = 样例的 `node` / `instanceId` / `attempt` / `error`；`attempt` 是**刚失败的那次尝试**编号（1 起），`error` 是失败错误的消息文本；只在"重试确实会发生"时发出（实例已取消就不发，R20a）；`node_finished.durationMs` 是**实例墙钟时长**，含重试与退避（不是最后一次尝试的耗时）；
 - 事件同时经 `onEvent` 实时发出：**顺序保证 = 完成序（实时性优先）**，字段 `seq` 供需要全序的消费者（重放、审计）重排；
 - `logOutputs: "hash"` 模式下 input/output 只记 SHA-256（法律文书敏感；`onEvent` 同样受此开关约束，避免全文经回调泄露）；
 - 日志写失败：默认 `onLogError: "fail"` 使 run 失败（审计要求），可配 `"warn"` 降级；

@@ -115,13 +115,25 @@ export type Services = {
 };
 
 /**
+ * sleep 的返回值（R20）：**公开契约不变**——`Services.sleep` 依然是
+ * `(ms) => Promise<void>`，注入实现不需要知道这个类型。默认实现额外挂一个非枚举的
+ * `cancel()`（清掉未到期的定时器），引擎只做**能力探测**（`typeof cancel === "function"`）：
+ * run 结束、竞速分出胜负之后，把已不再等待的睡眠句柄清掉，事件循环不再被引擎持有的
+ * 计时器拖住。等待期间（退避 = 进度等待）计时器保持 ref'd，进程不会在退避中途退出。
+ */
+export interface SleepResult extends Promise<void> {
+	readonly cancel?: () => void;
+}
+
+/**
  * compile 期归一后的运行服务（Task 8 R3）：三个字段全部必填，
- * 缺省值在 compile 时落定（Date.now / setTimeout / Math.random），
- * 引擎内部不再处理 undefined。
+ * 缺省值在 compile 时落定（Date.now / 可取消的 setTimeout / Math.random），
+ * 引擎内部不再处理 undefined。`sleep` 的返回类型放宽到 {@link SleepResult}
+ * （可选 `cancel`），注入的普通 `(ms) => Promise<void>` 依然兼容（R20）。
  */
 export type ResolvedServices = {
 	clock: () => number;
-	sleep: (ms: number) => Promise<void>;
+	sleep: (ms: number) => SleepResult;
 	random: () => number;
 };
 
