@@ -91,7 +91,9 @@ START→load_doc→extract(抽条款)─ Send(review, {clause=c2}) ─┤→ gat
 
 ```ts
 import { StateGraph, Send, START, END, fnNode, llmNode, agentNode, append } from "pi-workflow";
-import { T, type Static } from "typebox";
+import { Type as T, Value, type Static } from "typebox";
+// 注：typebox 1.3.36 实测根导出为 `Type`（非 `T`），`Value` 在 `typebox/value` 子路径——
+// 若上式报错，用：`import { Type as T, type Static } from "typebox"; import { Value } from "typebox/value";`
 
 const ClauseList = T.Object({ clauses: T.Array(T.Object({ id: T.String(), text: T.String() })) });
 const RiskReport = T.Object({ clauseId: T.String(), risks: T.Array(T.String()),
