@@ -1,11 +1,13 @@
 /**
  * Task 6：compile 期全量校验（设计 §6.1/§6.2/§6.3/§6.5）与封印（§6.8）。
  *
- * 契约（裁定 R4/R10/R11/R12/R13/R14）：
+ * 契约（裁定 R4/R10/R11/R12/R13/R14/R22/R23/R24/R25）：
  * - 错误一次聚合报完：issues 非空 → 单次 `GraphValidationError("graph invalid")`，绝不 fail-fast；
  * - 警告永不抛：挂在 `CompiledGraphData.warnings`，消息是纯文本（无 "warning:" 前缀，R12）；
  * - 只要图里有 router，可达性检查整体放弃（router/Send 目标静态不可知，宁漏勿误报，R13）；
  * - writeTo 的 key 宇宙只来自 `stateSchema.properties`；channels 不是 key 全集（R14）；
+ * - 哨兵位置的死边（END 源 / START 目标）与 START router 都是 compile 期错误（R22/R23）；
+ * - `"__proto__"` 不得作 writeTo（R24；foldUpdates 的写入侧同样拒）；
  * - compile 成功后 builder 封印：addNode/addEdge/addConditionalEdges 抛 `GraphSealedError`。
  */
 
@@ -174,13 +176,25 @@ describe("compile validation: reference existence (设计 §6.1)", () => {
 		expect(error.issues[0]).toContain("router source");
 	});
 
-	it("accepts a router registered from START (an alternative to START's out-edge)", () => {
+	it("reports a router registered from START (never evaluated in M1, R22)", () => {
 		const graph = new StateGraph<State>()
 			.addNode("a", fnNode<State>(noop))
 			.addConditionalEdges(START, () => "a")
 			.addEdge("a", END);
 
-		expect(() => graph.compile()).not.toThrow();
+		const error = captureIssues(() => graph.compile());
+		expect(error.issues).toHaveLength(1);
+		expect(error.issues[0]).toContain('router source "START" is not allowed');
+	});
+
+	it("reports exactly one issue when START has both a plain edge and a router (R22)", () => {
+		// router 已单报 R22 错误：START 出边判定不再叠加第二条（routers.has(START) 仍计入）
+		const graph = minimal().addConditionalEdges(START, () => "a");
+
+		const error = captureIssues(() => graph.compile());
+
+		expect(error.issues).toHaveLength(1);
+		expect(error.issues[0]).toContain('router source "START" is not allowed');
 	});
 
 	it("accepts references registered after the edge/router (order is irrelevant)", () => {
@@ -192,6 +206,65 @@ describe("compile validation: reference existence (设计 §6.1)", () => {
 			.addNode("b", fnNode<State>(noop));
 
 		expect(dataOf(graph).nodes.size).toBe(2);
+	});
+});
+
+describe("compile validation: sentinel positions (设计 §6.1, R23)", () => {
+	it("reports an edge from END (the exit sentinel has no instances)", () => {
+		const graph = minimal().addEdge(END, "a");
+
+		const error = captureIssues(() => graph.compile());
+
+		expect(error.issues).toHaveLength(1);
+		expect(error.issues[0]).toBe(
+			'edge source "END" is the exit sentinel and cannot have outgoing edges',
+		);
+	});
+
+	it("reports an END → END edge through the endEdgeSources path (R23)", () => {
+		const graph = minimal().addEdge(END, END);
+
+		const error = captureIssues(() => graph.compile());
+
+		expect(error.issues).toHaveLength(1);
+		expect(error.issues[0]).toBe(
+			'edge source "END" is the exit sentinel and cannot have outgoing edges',
+		);
+	});
+
+	it("reports an edge targeting START (the entry sentinel is not a node)", () => {
+		const graph = minimal().addEdge("a", START);
+
+		const error = captureIssues(() => graph.compile());
+
+		expect(error.issues).toHaveLength(1);
+		expect(error.issues[0]).toBe(
+			'edge target "START" (from "a") is the entry sentinel and cannot be an edge target',
+		);
+	});
+
+	it("reports a START → START self-edge (R23)", () => {
+		const graph = minimal().addEdge(START, START);
+
+		const error = captureIssues(() => graph.compile());
+
+		expect(error.issues).toHaveLength(1);
+		// 消息里的目标名固定显示为 "START"；`from` 是 map 键原值（START 的内部键 "__start__"）
+		expect(error.issues[0]).toBe(
+			`edge target "START" (from "${START}") is the entry sentinel and cannot be an edge target`,
+		);
+	});
+});
+
+describe("compile validation: unregistered-source dedup (Minor 6/R25)", () => {
+	it("reports one issue when a source has both a plain edge and an END edge", () => {
+		// plainEdges 循环报过的未注册源记入集合，endEdgeSources 循环跳过——只报 1 条
+		const graph = minimal().addEdge("ghost", "a").addEdge("ghost", END);
+
+		const error = captureIssues(() => graph.compile());
+
+		expect(error.issues).toHaveLength(1);
+		expect(error.issues[0]).toContain('edge source "ghost"');
 	});
 });
 
@@ -281,6 +354,25 @@ describe("compile validation: writeTo (设计 §6.5)", () => {
 
 		expect(error.issues).toHaveLength(1);
 		expect(error.issues[0]).toContain('"nope"');
+	});
+
+	it('reports writeTo "__proto__" as forbidden, without a second universe issue (R24)', () => {
+		// R24：__proto__ 是原型污染面（foldUpdates 写入侧同样拒）；此处单独报并
+		// 跳过宇宙校验——恰好 1 条，不是 2 条
+		const stateSchema = Type.Object({ count: Type.Number() });
+		const graph = minimal({ stateSchema }).addNode("summary", {
+			kind: "llm",
+			name: "",
+			handler: noop,
+			writeTo: "__proto__",
+		});
+
+		const error = captureIssues(() => graph.compile());
+
+		expect(error.issues).toHaveLength(1);
+		expect(error.issues[0]).toBe(
+			'node "summary" writeTo key "__proto__" is forbidden',
+		);
 	});
 
 	it("uses the stateSchema universe even when channels list other keys (R14)", () => {

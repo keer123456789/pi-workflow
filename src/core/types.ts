@@ -185,6 +185,7 @@ export type RunEvent =
 			node: string;
 			instanceId: string;
 			output: unknown;
+			/** 实例墙钟时长：含重试与退避（非最后一次尝试耗时，§8.1）。 */
 			durationMs: number;
 	  }
 	| {
@@ -252,9 +253,8 @@ export type RunOptions = {
 	runTimeoutMs?: number;
 	signal?: AbortSignal;
 	onEvent?: (e: RunEvent) => void;
-	logDir?: string;
-	logOutputs?: "full" | "hash";
-	onLogError?: "fail" | "warn";
+	// R21：logDir / logOutputs / onLogError 属 §8（M2，随 JSONL 落盘一并加入）。
+	// M1 不含这三个字段——公开类型里的未实现字段 = 虚假 API（配置了却被静默忽略）。
 };
 
 /** run() 的产物（注意：不是裸 state，与 langgraph 的 invoke 有差异，设计 §12）。 */

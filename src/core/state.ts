@@ -83,6 +83,16 @@ export function foldUpdates<S extends object>(
 	const mutable: Record<string, unknown> = next;
 
 	for (const { key, value, writer } of updates) {
+		// R24：原型污染守卫，必须在一切写入/reducer 查找之前。`mutable[key] = value`
+		// 对 "__proto__" 走的是 Object.prototype 的原型 setter——值为对象时改的是
+		// state 的原型（污染，消费方 Object.assign 还会传下去），值非对象时**静默丢弃**
+		// （连数据都错）。名为 "__proto__" 的 channel 不可用（无人需要）。
+		if (key === "__proto__") {
+			throw new InvalidWriteError(
+				'channel key "__proto__" is forbidden (it would mutate the state object\'s prototype)',
+				{ key, writers: [writer] },
+			);
+		}
 		// 用 hasOwn 而非原型链查找：key 恰好叫 "constructor" / "toString" 时
 		// 不能被 Object.prototype 上的成员误当成 reducer。
 		const reducer = Object.hasOwn(reducers, key) ? reducers[key] : undefined;

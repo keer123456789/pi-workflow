@@ -360,4 +360,16 @@ describe("foldUpdates", () => {
 		expect(thrown.key).toBe("toString");
 		expect(thrown.writers).toEqual(["n1", "n2"]);
 	});
+
+	it('rejects the "__proto__" key before any write (prototype pollution guard, R24)', () => {
+		// mutable["__proto__"] = value 走原型 setter：对象值 → 改 state 原型（污染），
+		// 非对象值 → 静默丢弃。写入侧立即抛 InvalidWriteError。
+		const thrown = captureInvalidWriteError(() =>
+			foldUpdates({}, [{ key: "__proto__", value: { x: 1 }, writer: "n" }], {}),
+		);
+
+		expect(thrown.message).toContain('channel key "__proto__" is forbidden');
+		expect(thrown.key).toBe("__proto__");
+		expect(thrown.writers).toEqual(["n"]);
+	});
 });

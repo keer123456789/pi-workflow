@@ -176,6 +176,40 @@ describe("superstep atomicity: commit rules (设计 §5.1:326-332)", () => {
 		expect(ofType(events, "run_finished")[0].status).toBe("failed");
 	});
 
+	it('rejects a write to the "__proto__" channel as InvalidWriteError without committing (R24)', async () => {
+		type S = { x?: number };
+		const events: RunEvent[] = [];
+
+		const g = new StateGraph<S>()
+			.addNode(
+				"a",
+				fnNode<S>(
+					// 计算键是必须的：`{ __proto__: ... }` 字面量只改对象原型、不产生自有属性，
+					// 引擎（Object.keys）根本看不见；计算键才产出真正的 "__proto__" 自有写入。
+					() => ({ ["__proto__"]: { polluted: true } }) as Partial<S>,
+				),
+			)
+			.addEdge(START, "a")
+			.addEdge("a", END);
+
+		const error = await captureRejection(
+			run(g, {}, { onEvent: (e) => events.push(e) }),
+		);
+
+		expect(error).toBeInstanceOf(InvalidWriteError);
+		const writeError = error as InvalidWriteError;
+		expect(writeError.message).toContain(
+			'channel key "__proto__" is forbidden',
+		);
+		expect(writeError.key).toBe("__proto__");
+		expect(writeError.writers).toEqual(["a"]);
+		// 原样透传（不包 NodeExecutionError）：折叠失败 → 超步不提交
+		expect(error).not.toBeInstanceOf(NodeExecutionError);
+		expect(ofType(events, "superstep_committed")).toHaveLength(0);
+		expect(ofType(events, "superstep_aborted")).toHaveLength(1);
+		expect(ofType(events, "run_finished")[0].status).toBe("failed");
+	});
+
 	it("commits normally when each node writes its own key (control)", async () => {
 		type S = { x?: number; y?: number };
 		const { state } = await run(

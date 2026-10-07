@@ -1093,6 +1093,11 @@ function resolveTimeoutMs(timeoutMs: number | undefined): number | undefined {
 	return timeoutMs;
 }
 
+// 归一化口径（Minor 10/R25）：预算与并发**有意不同**——
+// - 预算：0/负数原样保留 = 零容忍（任何非空批次都越限，与 recursionLimit:0 同构）；
+// - 并发：0/负数抬到 1（槽位为 0 的调度器一个实例都启动不了 = 死锁）；
+// - 非有限值（NaN / ±Infinity）两处一律回落各自默认值——Infinity **不代表"不限"**
+//   （落地界限形同虚设，与 recursionLimit 同一兜底策略）。
 /**
  * 实例预算（T12，§4.4/§5.3）：未指定或非有限 → 默认值（NaN 与 ±Infinity 都会让
  * `pending.length > limit` / `累计 > limit` 的比较失效，护栏形同虚设——与 recursionLimit
@@ -1337,6 +1342,9 @@ function normalizeRoute(result: RouterResult, nodeId: string): RouteItem[] {
 		return [result];
 	}
 	if (Array.isArray(result)) {
+		// Minor 7（R25）：嵌套数组被**有意展平**——RouterResult 类型只声明单层数组，
+		// 但 JS 调用方可以构造嵌套（如 `[[new Send(...)]]`）。这是容错展平而非报错
+		// （T9 裁定 + final review 确认：接受现状，仅加注释固化意图）。
 		return result.flatMap((item) => normalizeRoute(item, nodeId));
 	}
 	throw new RouterError(

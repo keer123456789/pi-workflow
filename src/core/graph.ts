@@ -176,12 +176,27 @@ export class StateGraph<S extends object> {
 		// §6.1：边/router 引用的节点必须已注册。
 		// START/END 是哨兵不是节点：START 作边起点天然合法（起点必须是虚拟入口）；
 		// router 只豁免 START——"END 的 router" 永远不可达，按未注册处理。
+		// R23：哨兵位置的死边一律报错——END 作源（没有实例）与 START 作目标
+		//（不是执行节点）产生的边永远不触发任何节点，静默接受是 footgun；
+		// addEdge(START, END) 依然合法（START 作源、END 作目标）。
+		// Minor 6：同一 from 同时有普通边与 END 边时，两条路径会报同一条"未注册源"
+		// 消息——plainEdges 循环报过的 from 记进集合，endEdgeSources 循环跳过。
+		const unregisteredSources = new Set<string>();
 		for (const [from, targets] of this.plainEdges) {
-			if (from !== START && from !== END && !this.nodes.has(from)) {
+			if (from === END) {
+				issues.push(
+					'edge source "END" is the exit sentinel and cannot have outgoing edges',
+				);
+			} else if (from !== START && !this.nodes.has(from)) {
 				issues.push(`edge source "${from}" is not a registered node`);
+				unregisteredSources.add(from);
 			}
 			for (const to of targets) {
-				if (to !== START && to !== END && !this.nodes.has(to)) {
+				if (to === START) {
+					issues.push(
+						`edge target "START" (from "${from}") is the entry sentinel and cannot be an edge target`,
+					);
+				} else if (to !== END && !this.nodes.has(to)) {
 					issues.push(
 						`edge target "${to}" (from "${from}") is not a registered node`,
 					);
@@ -190,20 +205,35 @@ export class StateGraph<S extends object> {
 		}
 		// END 边不在 plainEdges 里（构建器契约），它们的 from 同样要查存在性——
 		// 否则 addEdge("typo", END) 这类悬空引用会静默通过（§6.1 的典型拼写错误）。
-		// END 作起点按 R1 裁定保持豁免（与普通边的起点豁免一致）。
+		// R23：END 作起点是永久死边 → 报错（原 R1 的豁免被 R23 取代）。
 		for (const from of this.endEdgeSources) {
-			if (from !== START && from !== END && !this.nodes.has(from)) {
+			if (from === END) {
+				issues.push(
+					'edge source "END" is the exit sentinel and cannot have outgoing edges',
+				);
+			} else if (
+				from !== START &&
+				!this.nodes.has(from) &&
+				!unregisteredSources.has(from)
+			) {
 				issues.push(`edge source "${from}" is not a registered node`);
 			}
 		}
 		for (const from of this.routers.keys()) {
-			if (from !== START && !this.nodes.has(from)) {
+			// R22：START 的 router 在 M1 永远不被求值（router 只对实例求值，START 没有
+			// 实例）——静默死图，compile 期直接报错；END 的 router 走"未注册"分支。
+			if (from === START) {
+				issues.push(
+					'router source "START" is not allowed: a router on START would never be evaluated (routers run only after node instances complete); use a plain edge from START to an entry node and register the router there',
+				);
+			} else if (!this.nodes.has(from)) {
 				issues.push(`router source "${from}" is not a registered node`);
 			}
 		}
 
 		// §6.2：START 必须有出边——普通边目标、显式 END 边、router 三者任一即可。
 		// 注意 plainEdges 不含 END 边，所以 END 边单独查 endEdgeSources。
+		// routers.has(START) 仍计入（START router 已由 R22 单报，不叠加第二条错误）。
 		const startTargets = this.plainEdges.get(START);
 		if (
 			(startTargets === undefined || startTargets.length === 0) &&
@@ -211,7 +241,7 @@ export class StateGraph<S extends object> {
 			!this.routers.has(START)
 		) {
 			issues.push(
-				"START has no outgoing edge: add an edge from START to the entry node, or register a router from START",
+				"START has no outgoing edge: add an edge from START to the entry node",
 			);
 		}
 
@@ -228,6 +258,12 @@ export class StateGraph<S extends object> {
 						`node "${name}" (kind "${def.kind}") must declare writeTo`,
 					);
 				}
+				continue;
+			}
+			// R24："__proto__" 是原型污染面（foldUpdates 写入侧同样拒）——单独报，
+			// 并跳过宇宙校验（避免同一 key 双报）。
+			if (def.writeTo === "__proto__") {
+				issues.push(`node "${name}" writeTo key "__proto__" is forbidden`);
 				continue;
 			}
 			if (universe !== undefined && !universe.has(def.writeTo)) {

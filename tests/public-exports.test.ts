@@ -122,6 +122,11 @@ describe("public surface: src/index.ts (设计 §10)", () => {
 
 		const events: RunEvent[] = [];
 		const runOptions: RunOptions = { onEvent: (event) => events.push(event) };
+		// R21 类型级 pin：logDir / logOutputs / onLogError 属 M2（§8），M1 的 RunOptions
+		// 不含这三个字段。字段若被加回，下面的 @ts-expect-error 自身会变成错误
+		// （"Unused '@ts-expect-error' directive"）→ typecheck 失败。
+		// @ts-expect-error logDir 属 M2（R21）
+		const m2RunOptions: RunOptions = { logDir: ".pi-workflow/runs/" };
 		const compiled: CompiledGraph<PublicState> = graph.compile(compileOptions);
 		const handle: RunHandle<PublicState> = compiled.run(
 			{ items: [1, 2], seen: [] },
@@ -155,6 +160,8 @@ describe("public surface: src/index.ts (设计 §10)", () => {
 		expect(typeof result.runId).toBe("string");
 		expect(events.map((event) => event.type)).toContain("superstep_committed");
 		expect(update.key).toBe("seen");
+		// 类型禁止只是编译期约束：运行期对象照样带着 logDir（同时避免 unused 告警）
+		expect(m2RunOptions).toEqual({ logDir: ".pi-workflow/runs/" });
 		expect(resolved.clock()).toBe(0);
 		expect(reducer([1], [2])).toEqual([1, 2]);
 		expect(data.nodes.has("worker")).toBe(true);

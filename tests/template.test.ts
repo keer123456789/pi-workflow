@@ -77,6 +77,10 @@ describe("interpolate: 嵌套路径", () => {
 		);
 		expect(error.key).toBe("a.constructor.name");
 	});
+
+	it("resolves an array index path ({items.0}) — indices are own properties (Minor 9/R25)", () => {
+		expect(interpolate("{items.0}", { items: ["a", "b"] })).toBe("a");
+	});
 });
 
 describe("interpolate: 缺失 key 抛 TemplateError", () => {
@@ -142,6 +146,11 @@ describe("interpolate: 花括号转义", () => {
 
 	it("turns }} into a literal }", () => {
 		expect(interpolate("a}}b", {})).toBe("a}b");
+	});
+
+	it("escapes a trailing {{ at the end of the template (Minor 9/R25)", () => {
+		// 尾部转义：`{{` 在模板末尾也按字面 `{` 输出（单遍扫描命中即转义，不看后继）
+		expect(interpolate("x{{", {})).toBe("x{");
 	});
 
 	it("mixes escapes with placeholders", () => {
