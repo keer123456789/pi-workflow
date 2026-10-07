@@ -100,9 +100,89 @@ export type Services = {
 };
 
 /**
+ * compile 期归一后的运行服务（Task 8 R3）：三个字段全部必填，
+ * 缺省值在 compile 时落定（Date.now / setTimeout / Math.random），
+ * 引擎内部不再处理 undefined。
+ */
+export type ResolvedServices = {
+	clock: () => number;
+	sleep: (ms: number) => Promise<void>;
+	random: () => number;
+};
+
+/**
+ * run 期事件流（设计 §8；Task 8 引入）。所有事件共享
+ * `seq`（全局单调的 eventSeq）、`superstep`、`ts`（services.clock()）与 `runId`。
+ * 顺序保证 = 完成序（实时性优先，§8.1）：需要全序的消费者用 seq 重排。
+ */
+export type RunEvent =
+	| {
+			seq: number;
+			superstep: number;
+			ts: number;
+			runId: string;
+			type: "run_started";
+			graph: string;
+			input: unknown;
+	  }
+	| {
+			seq: number;
+			superstep: number;
+			ts: number;
+			runId: string;
+			type: "node_started";
+			node: string;
+			instanceId: string;
+			kind: string;
+	  }
+	| {
+			seq: number;
+			superstep: number;
+			ts: number;
+			runId: string;
+			type: "node_finished";
+			node: string;
+			instanceId: string;
+			output: unknown;
+			durationMs: number;
+	  }
+	| {
+			seq: number;
+			superstep: number;
+			ts: number;
+			runId: string;
+			type: "node_failed";
+			node: string;
+			instanceId: string;
+			error: string;
+	  }
+	| {
+			seq: number;
+			superstep: number;
+			ts: number;
+			runId: string;
+			type: "superstep_committed";
+	  }
+	| {
+			seq: number;
+			superstep: number;
+			ts: number;
+			runId: string;
+			type: "superstep_aborted";
+	  }
+	| {
+			seq: number;
+			superstep: number;
+			ts: number;
+			runId: string;
+			type: "run_finished";
+			status: "completed" | "failed";
+			durationMs: number;
+	  };
+
+/**
  * run 期执行控制（设计 §4.4；默认值：recursionLimit 25、maxConcurrency 8、
  * maxInstancesPerSuperstep 1000、maxTotalInstances 10000）。
- * onEvent 字段待 Task 8 引入 RunEvent 后增补。
  */
 export type RunOptions = {
 	recursionLimit?: number;
@@ -111,6 +191,7 @@ export type RunOptions = {
 	maxTotalInstances?: number;
 	runTimeoutMs?: number;
 	signal?: AbortSignal;
+	onEvent?: (e: RunEvent) => void;
 	logDir?: string;
 	logOutputs?: "full" | "hash";
 	onLogError?: "fail" | "warn";

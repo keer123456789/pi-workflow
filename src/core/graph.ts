@@ -10,11 +10,12 @@
  *   compile 照常返回；
  * - compile 成功即封印 builder：后续 addNode/addEdge/addConditionalEdges 抛
  *   `GraphSealedError`（§6.8）。封印是纯标志位——不 freeze 数据、节点或调用方对象（R11）；
- * - run/invoke 仍是占位实现（引擎接线在 Task 8）。
+ * - compile 期把可选 services 归一为必填 ResolvedServices（R3），run/invoke 接引擎（executeRun）。
  */
 
 import type { TSchema } from "typebox";
 
+import { executeRun, resolveServices } from "./engine.js";
 import { GraphSealedError, GraphValidationError } from "./errors.js";
 import type { StateSchema } from "./state.js";
 import {
@@ -135,16 +136,16 @@ export class StateGraph<S extends object> {
 			warnings: this.collectWarnings(),
 		};
 
-		// 占位实现：Task 8 用 data 接引擎（本任务只负责校验与封印）。
-		const run = async (
-			_initial: S,
-			_options?: RunOptions,
-		): Promise<RunResult<S>> => {
-			throw new Error("not implemented");
-		};
+		// 依赖解析（R3）：compile 期一次性把可选 services 归一为必填 ResolvedServices，
+		// run 期（executeRun 第 4 参）不再碰缺省值。
+		const resolvedServices = resolveServices(opts?.services);
+
+		// 引擎接线（Task 8）：run 与 invoke 同一入口，options 缺省为 {}。
+		const run = (initial: S, options?: RunOptions): Promise<RunResult<S>> =>
+			executeRun(data, initial, options ?? {}, resolvedServices);
 
 		// 具体对象额外携带装配好的 data（结构子类型，公开面仍是 CompiledGraph<S>）：
-		// Task 8 用 data 接引擎，测试也靠它观测编译产物（warnings/plainEdges……）。
+		// 测试靠它观测编译产物（warnings/plainEdges……）。
 		const compiled: CompiledGraph<S> & { readonly data: CompiledGraphData<S> } =
 			{
 				name: data.name,

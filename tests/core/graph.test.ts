@@ -323,12 +323,15 @@ describe("compile()", () => {
 		expect(dataOf(graph).plainEdges.has("a")).toBe(false);
 	});
 
-	it("returns a CompiledGraph whose run and invoke reject with not implemented", async () => {
+	it("returns a CompiledGraph whose run and invoke are wired to the engine (Task 8)", async () => {
 		const app = chainedGraph(["a"], { name: "flow" }).compile();
 		const initial: State = { count: 0, log: [] };
 
 		expect(app.name).toBe("flow");
-		await expect(app.run(initial)).rejects.toThrow("not implemented");
-		await expect(app.invoke(initial)).rejects.toThrow("not implemented");
+		const first = await app.run(initial);
+		const second = await app.invoke(initial);
+		expect(first.state).toEqual(initial);
+		expect(first.runId).toBeTruthy();
+		expect(second.runId).not.toBe(first.runId);
 	});
 });
