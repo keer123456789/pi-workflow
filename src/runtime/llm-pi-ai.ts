@@ -67,7 +67,7 @@ function probePiAi(): boolean {
 	}
 	try {
 		// 返回值按 `unknown` 收：打包器/自定义 loader 的 shim 可能返回 Promise 之类的
-		// 非字符串——`!== undefined` 会把它们误判成"可用"，还会留下未处理的 rejection。
+		// 非字符串——`!== undefined` 会把它们误判成"可用"；只认字符串（判定不看其 settle）。
 		const resolve = (
 			import.meta as ImportMeta & {
 				resolve?: (specifier: string) => unknown;
