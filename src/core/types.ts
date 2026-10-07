@@ -7,6 +7,8 @@
 
 import type { TSchema } from "typebox";
 
+import type { RunLogger } from "../log/runlog.js";
+import type { CompleteFn, TokenUsage } from "../runtime/executor.js";
 import type { Send } from "./send.js";
 import type { StateSchema } from "./state.js";
 
@@ -30,6 +32,12 @@ export type NodeContext = {
 	 * 节点**必须**尊重它（长循环里周期性检查，§7.4:440）——引擎无法抢占不检查信号的节点。
 	 */
 	signal: AbortSignal;
+	/**
+	 * 上报本次尝试的 token 用量（D11）：按 attempt 记录、最后一次生效；只有**成功**
+	 * 尝试的值会挂到 `node_finished.usage`（失败/重试的尝试不产生 usage）。
+	 * 引擎**总是提供**这个回调（声明可选是给手工组装 ctx 的调用方留余地）。
+	 */
+	reportUsage?: (usage: TokenUsage) => void;
 };
 
 /** 节点主体：输入只读，返回本次要写入 state 的增量。 */
@@ -48,6 +56,12 @@ export type NodeDefinition<S, I = S> = {
 	handler: NodeHandler<S, I>;
 	inputType?: TSchema;
 	writeTo?: string;
+	/**
+	 * 补全实现（D12）：**只有 `kind === "llm"` 允许声明**（其他 kind 声明它 →
+	 * compile 期 issue）。compile 解析顺序 `def.complete ?? services.complete ??
+	 * pi-ai 默认（可用时）`；全缺 → compile 报"has no completion implementation"。
+	 */
+	complete?: CompleteFn;
 	retry?: { maxAttempts: number };
 	timeoutMs?: number;
 };
@@ -107,8 +121,13 @@ export type CompileOptions = { name?: string; services?: Services };
 export type Services = {
 	// biome-ignore lint/suspicious/noExplicitAny: 对外字段按任务 brief verbatim（M2/M3 才细化具体配置）
 	agent?: { subprocess?: any; sdk?: any };
-	complete?: unknown;
-	logger?: unknown;
+	/** llm 节点的默认补全实现（§4.6/D12）：缺省时 compile 用 pi-ai 适配器（§9.4）。 */
+	complete?: CompleteFn;
+	/**
+	 * run 日志实现（§8/D2）：`=== undefined` → 用内置 JSONL 实现（日志默认开启）；
+	 * `!== undefined` → **原样使用**——空对象 `{}`（钩子全可选）= 全静默（显式关闭）。
+	 */
+	logger?: RunLogger;
 	clock?: () => number;
 	sleep?: (ms: number) => Promise<void>;
 	random?: () => number;
@@ -185,6 +204,11 @@ export type RunEvent =
 			node: string;
 			instanceId: string;
 			output: unknown;
+			/**
+			 * 成功尝试的用量（D11）：handler 经 `ctx.reportUsage` 上报（按 attempt 取末次）。
+			 * 未上报时**不落此字段**；失败/重试的尝试不产生 usage。
+			 */
+			usage?: TokenUsage;
 			/** 实例墙钟时长：含重试与退避（非最后一次尝试耗时，§8.1）。 */
 			durationMs: number;
 	  }
@@ -253,8 +277,23 @@ export type RunOptions = {
 	runTimeoutMs?: number;
 	signal?: AbortSignal;
 	onEvent?: (e: RunEvent) => void;
-	// R21：logDir / logOutputs / onLogError 属 §8（M2，随 JSONL 落盘一并加入）。
-	// M1 不含这三个字段——公开类型里的未实现字段 = 虚假 API（配置了却被静默忽略）。
+	/**
+	 * 日志目录（§8/D2）：默认 `PI_WORKFLOW_LOG_DIR` 环境变量，再缺省
+	 * `.pi-workflow/runs`；每次 run 写 `<dir>/<YYYYMMDDTHHmmssSSSZ>-<runId>/run.jsonl`。
+	 */
+	logDir?: string;
+	/**
+	 * 敏感输入/输出的记录方式（§8.1/D7）：默认 `"full"`；`"hash"` 时
+	 * `run_started.input`、`node_started.input`、`node_finished.output` 替换为
+	 * `"sha256:<hex>"`——onEvent 与日志文件两路都拿脱敏后的值。
+	 */
+	logOutputs?: "full" | "hash";
+	/**
+	 * 日志写失败策略（§8.1/D8）：默认 `"fail"`——logger 任一钩子抛错使 run 以
+	 * `WorkflowError("run log write failed: …")` 拒绝（含 `run_finished` 之后
+	 * `onRunFinish` 抛错；审计优先，刻意）；`"warn"` 只 `console.warn` 并继续。
+	 */
+	onLogError?: "fail" | "warn";
 };
 
 /** run() 的产物（注意：不是裸 state，与 langgraph 的 invoke 有差异，设计 §12）。 */

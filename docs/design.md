@@ -207,6 +207,7 @@ type NodeContext = {
   instanceId: string;      // = `${node}#${seq}`
   seq: number;             // 全局序，与日志、合并顺序一致
   signal: AbortSignal;     // 实例信号（见 §7.4）：run 取消/兄弟失败时触发；节点必须尊重
+  reportUsage?: (usage: TokenUsage) => void;   // M2/D11：引擎总是提供；按 attempt 记录，成功尝试的用量挂 node_finished.usage
 };
 
 type NodeDefinition<S, I = S> = {
@@ -215,6 +216,7 @@ type NodeDefinition<S, I = S> = {
   handler: (input: Readonly<I>, ctx: NodeContext) => Promise<Partial<S>> | Partial<S>;
   inputType?: T.TSchema;   // 可选：运行期校验进入本节点的输入（Send 路径尤其需要）
   writeTo?: keyof S;       // llm/agent：产出写入的 key（经该 key 的 reducer）
+  complete?: CompleteFn;   // M2/D12：仅 kind === "llm" 合法（其他 kind 声明 → compile 期 issue）
   retry?: { maxAttempts: number };   // 仅 llm/agent；fnNode 不提供此参数
   timeoutMs?: number;
 };
@@ -244,6 +246,8 @@ function agentNode<S, K extends keyof S & string>(cfg: {
 }): NodeDefinition<S>;
 ```
 
+> M2 补充（D11/D12）：`NodeContext.reportUsage` 由引擎**总是提供**——按 attempt 记录、成功尝试的用量挂 `node_finished.usage`（失败/重试的尝试不产生 usage）。`NodeDefinition.complete` 是 **llm 专用**：只有 `kind === "llm"` 的定义可以声明（其他 kind 声明 → compile 期 issue）；compile 解析顺序 `def.complete ?? services.complete ?? pi-ai 默认（可用时）`，全缺 → compile 报"has no completion implementation"的 issue（§9.4）。
+
 ### 4.4 执行入口
 
 ```ts
@@ -255,9 +259,9 @@ const { state, runId } = await app.run(initialState, {
   runTimeoutMs?: number;              // 默认无；run 级超时
   signal?: AbortSignal;               // 外部取消（工作台"停止"按钮）
   onEvent?: (e: RunEvent) => void;    // 实时事件流；顺序保证见 §8.2
-  logDir?: string;                    // 默认 .pi-workflow/runs/  // M2（§8）；M1 不含此字段
-  logOutputs?: "full" | "hash";       // 默认 "full"  // M2（§8）；M1 不含此字段
-  onLogError?: "fail" | "warn";       // 默认 "fail"（法律审计场景日志不可静默丢失）  // M2（§8）；M1 不含此字段
+  logDir?: string;                    // 默认 PI_WORKFLOW_LOG_DIR ?? ".pi-workflow/runs"（§8/D2）
+  logOutputs?: "full" | "hash";       // 默认 "full"；"hash" 时 input/output 只记 SHA-256（§8.1/D7）
+  onLogError?: "fail" | "warn";       // 默认 "fail"（法律审计场景日志不可静默丢失）——日志写失败使 run 拒绝（§8.1/D8）
 });
 // run()/invoke() 返回 RunHandle<S> = Promise<{ state, runId }> & { cancel(): void }：
 // 对运行中的 handle 调 cancel() 即中止本次 run（abort run signal，§7.4 的 run 级取消），
@@ -267,7 +271,7 @@ const { state, runId } = await app.run(initialState, {
 // 也有 langgraph 风格的 invoke() 别名——但注意 invoke() 返回 { state, runId } 而非裸 state，差异见 §12。
 ```
 
-> logDir / logOutputs / onLogError 属 §8（M2）：M1 的 RunOptions 不含这三个字段（避免"配置了却被静默忽略"的虚假 API，R21）；字段随 M2 的 JSONL 落盘一并加入。
+> 日志**默认开启**（D2）：不配置也写 `<logDir ?? PI_WORKFLOW_LOG_DIR ?? ".pi-workflow/runs">/<YYYYMMDDTHHmmssSSSZ>-<runId>/run.jsonl`。关闭 = `services.logger: {}`（钩子全可选，空对象即全静默）；自定义实现 = `services.logger !== undefined`（原样使用）。注意 `onLogError` 默认 `"fail"`：默认目录不可写时每次 run 都以 `WorkflowError("run log write failed: …")` 拒绝（审计优先，刻意）；放宽用 `"warn"` 或关闭日志。
 
 ### 4.5 标准 reducer（库导出）
 
@@ -290,8 +294,8 @@ type CompileOptions = {
       subprocess?: PiSubprocessConfig;    // executor:"subprocess" 的二级配置
       sdk?: PiSdkConfig;                  // executor:"sdk" 的二级配置
     };
-    complete?: CompleteFn;                // llm 节点默认补全实现；缺省用 pi-ai 适配器
-    logger?: RunLogger;                   // 默认 JSONL 实现（§8）
+    complete?: CompleteFn;                // llm 节点默认补全实现（§9.1）；缺省用 pi-ai 适配器
+    logger?: RunLogger;                   // run 日志（§8，默认开启）：!== undefined 即原样使用，{} = 全静默（D2/R2）
     clock?: () => number;                 // 可注入时钟/睡眠/随机——重试退避可测试
     sleep?: (ms: number) => Promise<void>; // 契约不变；默认实现额外带非枚举 cancel()（R20）——
                                            // 引擎只做能力探测：竞速结束/run 结束时清掉已不再等待的
@@ -430,6 +434,7 @@ for step in 0..:
 - 分类标准沿用 forge 的正则族：429 / 408 / 5xx / rate limit / timeout / ECONNRESET / socket hang up；llm 输出不符合 schema 同样可重试（同 prompt 重发）；
 - `retry.maxAttempts`：**总尝试次数**（含首次），默认 1（不重试）；
 - 退避：指数 base 500ms，上限 30s，full jitter（`sleep(min(base * 2^已重试次数 * random(), 30s))`，**指数用已重试次数，0 起**——首次重试的基数即 base 500ms；上限截断）；`clock` / `sleep` / `random` 均可注入（§4.6），重试时序可测试；
+- （分类落地于 M2：正则族 + 可重试标记，不可重试错误立即失败）
 
 ### 7.3 超时
 
@@ -458,22 +463,24 @@ for step in 0..:
 
 ### 8.1 事件与存储
 
-每次 run 写一个 JSONL 文件：`<logDir>/<20261007T120000Z>-<runId>/run.jsonl`（**目录名不含冒号**，Windows 合法）：
+**启用日志的 run** 每次写一个 JSONL 文件：`<logDir ?? PI_WORKFLOW_LOG_DIR ?? ".pi-workflow/runs">/<YYYYMMDDTHHmmssSSSZ>-<runId>/run.jsonl`（**目录名不含冒号**，Windows 合法）：
 
 ```jsonl
 {"ts":"...","seq":1,"type":"run_started","runId":"...","graph":"contract-review","superstep":0,"input":{...}}
-{"ts":"...","seq":3,"type":"node_started","runId":"...","superstep":2,"node":"review","instanceId":"review#7","seq":7,"kind":"llm","input":{...}}
+{"ts":"...","seq":3,"type":"node_started","runId":"...","superstep":2,"node":"review","instanceId":"review#7","kind":"llm","input":{...}}
 {"ts":"...","seq":8,"superstep":2,"type":"node_retry","runId":"...","node":"review","instanceId":"review#7","attempt":1,"error":"429 rate limit"}
-{"ts":"...","seq":9,"type":"node_finished","runId":"...","superstep":2,"instanceId":"review#7","output":{...},"usage":{"tokens":1234},"durationMs":4200}
+{"ts":"...","seq":9,"type":"node_finished","runId":"...","superstep":2,"instanceId":"review#7","output":{...},"usage":{"input":1000,"output":234,"cacheRead":0,"cacheWrite":0,"totalTokens":1234},"durationMs":4200}
 {"ts":"...","seq":12,"type":"superstep_committed","runId":"...","superstep":2}
 {"ts":"...","type":"run_finished","runId":"...","status":"completed|failed","durationMs":...}
 ```
 
-- **所有事件带 `seq` 与 `superstep`**；失败超步的事件打标 `committed:false`，并追加 `superstep_aborted` 事件——事件溯源重放（v2）只重放 committed 超步；seq 从 1 起单调递增
+- **所有事件带 `seq` 与 `superstep`**；seq 从 1 起单调递增；**committed 语义 = 边界事件方案（D10）**：逐事件打标 `committed:false` 不可实现（事件实时按完成序发出，不缓冲不重排），某超步是否提交看它的事件之后跟随的边界事件——`superstep_committed`（已提交）/ `superstep_aborted`（未提交，含失败超步），消费方按最近边界判定；事件溯源重放（v2）只重放 committed 超步；
+- **文件布局（D9）**：每行一个 JSON 事件（与 `onEvent` 同序 = 完成序），行尾 `\n`、同步 append；文件至少含 `run_started` … `run_finished`；
 - `node_retry`（每次重试前一条）字段 = 样例的 `node` / `instanceId` / `attempt` / `error`；`attempt` 是**刚失败的那次尝试**编号（1 起），`error` 是失败错误的消息文本；只在"重试确实会发生"时发出（实例已取消就不发，R20a）；`node_finished.durationMs` 是**实例墙钟时长**，含重试与退避（不是最后一次尝试的耗时）；
+- `node_finished.usage?`（D11）：成功尝试经 `ctx.reportUsage` 上报的用量（按 attempt 取末次）；未上报时字段缺省，失败/重试的尝试不产生 usage；
 - 事件同时经 `onEvent` 实时发出：**顺序保证 = 完成序（实时性优先）**，字段 `seq` 供需要全序的消费者（重放、审计）重排；
-- `logOutputs: "hash"` 模式下 input/output 只记 SHA-256（法律文书敏感；`onEvent` 同样受此开关约束，避免全文经回调泄露）；
-- 日志写失败：默认 `onLogError: "fail"` 使 run 失败（审计要求），可配 `"warn"` 降级；
+- **脱敏（`logOutputs: "hash"`，D7）**：`run_started.input`、`node_started.input`、`node_finished.output` 三字段替换为字符串 `"sha256:<64位hex>"`（`sha256(JSON.stringify(value))`；stringify 抛错时对 `"[unserializable]"` 取哈希）——**onEvent 与日志文件两路都拿脱敏后的事件**（避免全文经回调泄露，法律文书敏感）；
+- 日志写失败：默认 `onLogError: "fail"` 使 run 失败（审计要求），可配 `"warn"` 降级（详见 §4.4 的 D8 说明）；
 - 日志是 v2 断点续跑的数据基础（事件溯源 + seq 重放）。
 
 ---

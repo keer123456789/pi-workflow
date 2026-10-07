@@ -4,8 +4,9 @@
  * 两条腿：
  * 1. **运行期值名不增不漏**：`Object.keys(import * as api)` 的精确集合——多导（内部设施
  *    泄漏）或少导（调用方拿不到）都直接红；
- * 2. **公开类型名在类型位置可用**：19 个类型名各用一次（含一个走公开 API 的最小图），
- *    名字缺失/改名时 `npm run typecheck` 失败——类型没有运行期痕迹，只能这样钉。
+ * 2. **公开类型名在类型位置可用**：22 个类型名各用一次（含一个走公开 API 的最小图；
+ *    M2 增 `TokenUsage`/`CompleteFn`/`RunLogger`），名字缺失/改名时 `npm run typecheck`
+ *    失败——类型没有运行期痕迹，只能这样钉。
  *
  * 第三个用例把公开面**当包用**：只用 `src/index.js` 的导出构建并跑通一张图
  * （Send 扇出 + append 合并 + 错误类实例判定），确认导出之间彼此自洽。
@@ -17,6 +18,7 @@ import type {
 	CompiledGraph,
 	CompiledGraphData,
 	CompileOptions,
+	CompleteFn,
 	GraphCfg,
 	NodeContext,
 	NodeDefinition,
@@ -27,11 +29,13 @@ import type {
 	RouterResult,
 	RunEvent,
 	RunHandle,
+	RunLogger,
 	RunOptions,
 	RunResult,
 	Services,
 	SleepResult,
 	StateSchema,
+	TokenUsage,
 } from "../src/index.js";
 import * as api from "../src/index.js";
 import {
@@ -85,6 +89,35 @@ describe("public surface: src/index.ts (设计 §10)", () => {
 	});
 
 	it("exports every public type name at type position (compile-time check)", async () => {
+		// —— M2 三个新公开类型名（D4/D5/D6）各在类型位置真实使用一次 ——
+		const usage: TokenUsage = {
+			input: 3,
+			output: 5,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 8,
+			cost: {
+				input: 0.1,
+				output: 0.2,
+				cacheRead: 0,
+				cacheWrite: 0,
+				total: 0.3,
+			},
+		};
+		const complete: CompleteFn = async (req) => ({ text: req.prompt, usage });
+		const loggerCalls: string[] = [];
+		const runLogger: RunLogger = {
+			onRunStart: (info) => {
+				loggerCalls.push(`start:${info.graph}`);
+			},
+			onEvent: (event) => {
+				loggerCalls.push(event.type);
+			},
+			onRunFinish: (info) => {
+				loggerCalls.push(`finish:${info.status}`);
+			},
+		};
+
 		// —— 每一个公开类型名都被真实使用一次；缺名/改名的代价是 typecheck 失败 ——
 		const channels: StateSchema<PublicState> = { seen: append };
 		const reducer: Reducer<number[]> = append as Reducer<number[]>;
@@ -93,10 +126,20 @@ describe("public surface: src/index.ts (设计 §10)", () => {
 			ctx,
 		) => {
 			const context: NodeContext = ctx;
+			// NodeContext.reportUsage（D11）——引擎总是提供；这里运行时是 no-op（M1 引擎未接线）
+			context.reportUsage?.(usage);
 			return { seen: [context.seq] };
 		};
 		const nodeDefinition: NodeDefinition<PublicState, { item: number }> =
 			fnNode(nodeHandler);
+		// NodeDefinition.complete（D12，仅 llm kind 合法）——手工定义、不进图
+		// （compile 对 llm 的校验属 M2 后续任务）
+		const llmDefinition: NodeDefinition<PublicState> = {
+			kind: "llm",
+			name: "classify",
+			handler: async () => ({}),
+			complete,
+		};
 		const router: Router<PublicState> = (state) => {
 			const result: RouterResult = state.items.map(
 				(item) => new Send("worker", { item }),
@@ -107,6 +150,8 @@ describe("public surface: src/index.ts (设计 §10)", () => {
 			name: "public-surface",
 			channels,
 		};
+		// Services.complete / Services.logger（D12/D2/R2）——不再是 unknown 占位
+		const services: Services = { complete, logger: runLogger };
 		const compileOptions: CompileOptions = {
 			services: {} satisfies Services,
 		};
@@ -122,11 +167,13 @@ describe("public surface: src/index.ts (设计 §10)", () => {
 
 		const events: RunEvent[] = [];
 		const runOptions: RunOptions = { onEvent: (event) => events.push(event) };
-		// R21 类型级 pin：logDir / logOutputs / onLogError 属 M2（§8），M1 的 RunOptions
-		// 不含这三个字段。字段若被加回，下面的 @ts-expect-error 自身会变成错误
-		// （"Unused '@ts-expect-error' directive"）→ typecheck 失败。
-		// @ts-expect-error logDir 属 M2（R21）
-		const m2RunOptions: RunOptions = { logDir: ".pi-workflow/runs/" };
+		// M2 正例 pin（D2，替代 R21 的 @ts-expect-error）：三字段已回归 RunOptions；
+		// 任一字段被删/改名，下面的对象字面量因 excess property 检查失败 → typecheck 红。
+		const m2RunOptions: RunOptions = {
+			logDir: ".pi-workflow/runs/",
+			logOutputs: "hash",
+			onLogError: "warn",
+		};
 		const compiled: CompiledGraph<PublicState> = graph.compile(compileOptions);
 		const handle: RunHandle<PublicState> = compiled.run(
 			{ items: [1, 2], seen: [] },
@@ -152,6 +199,19 @@ describe("public surface: src/index.ts (设计 §10)", () => {
 			routers: new Map(),
 			warnings: [],
 		};
+		// RunEvent.node_finished.usage?: TokenUsage（D11）——带 usage 的完成事件字面量
+		const finishedWithUsage: RunEvent = {
+			seq: 0,
+			superstep: 0,
+			ts: 0,
+			runId: "r",
+			type: "node_finished",
+			node: "classify",
+			instanceId: "classify#1",
+			output: null,
+			usage,
+			durationMs: 0,
+		};
 
 		const runResult: RunResult<PublicState> = await handle;
 		const result = runResult;
@@ -160,8 +220,12 @@ describe("public surface: src/index.ts (设计 §10)", () => {
 		expect(typeof result.runId).toBe("string");
 		expect(events.map((event) => event.type)).toContain("superstep_committed");
 		expect(update.key).toBe("seen");
-		// 类型禁止只是编译期约束：运行期对象照样带着 logDir（同时避免 unused 告警）
-		expect(m2RunOptions).toEqual({ logDir: ".pi-workflow/runs/" });
+		// M2 类型引用同时避免 unused 告警（运行期值只是类型 pin 的载体）
+		expect(m2RunOptions.logDir).toBe(".pi-workflow/runs/");
+		expect(services.complete).toBe(complete);
+		expect(services.logger).toBe(runLogger);
+		expect(llmDefinition.complete).toBe(complete);
+		expect(finishedWithUsage.type).toBe("node_finished");
 		expect(resolved.clock()).toBe(0);
 		expect(reducer([1], [2])).toEqual([1, 2]);
 		expect(data.nodes.has("worker")).toBe(true);
