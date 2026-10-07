@@ -205,7 +205,8 @@ export class StateGraph<S extends object> {
 			);
 		}
 
-		// §6.5：非 fn 节点必须声明 writeTo；声明了 writeTo 就必须是已知的 State key。
+		// §6.5：非 fn 节点必须声明 writeTo；声明了 writeTo 就必须是已知的 State key
+		//（key 宇宙只来自 stateSchema，R14；未知则整条跳过）。
 		// （"schema 必须合法"一条在 M1 是真空的——NodeDefinition 还没有 schema 字段，
 		// llm/agent 工厂要到 M2 才落地；typebox 对象本身即 JSON Schema，无需额外校验。）
 		const universe = this.stateKeyUniverse();
@@ -229,22 +230,22 @@ export class StateGraph<S extends object> {
 	}
 
 	/**
-	 * 已知的 State key 宇宙（§6.5 的 writeTo 校验用）：
-	 * stateSchema 提供 → 其 `properties` 的 keys（typebox 对象 schema）；
-	 * 否则 channels 非空 → channels 的 keys；
-	 * 两者都给不出 key（含 channels 默认为 `{}`）→ undefined = 宇宙未知，跳过校验。
+	 * 已知的 State key 宇宙（§6.5 的 writeTo 校验用，R14）：**只来自 `stateSchema`**，
+	 * 取其 `properties` 的 keys（typebox 对象 schema）。
+	 *
+	 * channels 不能当宇宙：`StateSchema<S>` 是 Partial 映射，只列"有自定义 reducer"的 key，
+	 * 而没有 reducer 的 key 合法可写（§5.1 直接覆盖写入）——拿 channels 当全集会把
+	 * `writeTo: "title"` + `channels: { logs: append }` 这类合法图判错。
+	 * 无 stateSchema（或它给不出可枚举的 properties）→ undefined = 宇宙未知，跳过校验。
 	 * 原则：宁可漏报，绝不误报。
 	 */
 	private stateKeyUniverse(): Set<string> | undefined {
-		if (this.stateSchema !== undefined) {
-			const properties = (this.stateSchema as { properties?: unknown })
-				.properties;
-			return isRecord(properties)
-				? new Set(Object.keys(properties))
-				: undefined;
+		if (this.stateSchema === undefined) {
+			return undefined;
 		}
-		const keys = Object.keys(this.channels);
-		return keys.length > 0 ? new Set(keys) : undefined;
+		const properties = (this.stateSchema as { properties?: unknown })
+			.properties;
+		return isRecord(properties) ? new Set(Object.keys(properties)) : undefined;
 	}
 
 	/** compile 期警告（设计 §6.2/§6.3）：永不算错误，不会导致 throw（R4）。 */

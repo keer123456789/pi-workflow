@@ -1,10 +1,11 @@
 /**
  * Task 6：compile 期全量校验（设计 §6.1/§6.2/§6.3/§6.5）与封印（§6.8）。
  *
- * 契约（裁定 R4/R10/R11/R12/R13）：
+ * 契约（裁定 R4/R10/R11/R12/R13/R14）：
  * - 错误一次聚合报完：issues 非空 → 单次 `GraphValidationError("graph invalid")`，绝不 fail-fast；
  * - 警告永不抛：挂在 `CompiledGraphData.warnings`，消息是纯文本（无 "warning:" 前缀，R12）；
  * - 只要图里有 router，可达性检查整体放弃（router/Send 目标静态不可知，宁漏勿误报，R13）；
+ * - writeTo 的 key 宇宙只来自 `stateSchema.properties`；channels 不是 key 全集（R14）；
  * - compile 成功后 builder 封印：addNode/addEdge/addConditionalEdges 抛 `GraphSealedError`。
  */
 
@@ -78,7 +79,8 @@ describe("compile validation: aggregation (设计 §6 一次报完)", () => {
 	it("throws a single GraphValidationError carrying every problem", () => {
 		const graph = new StateGraph<State>({
 			name: "broken",
-			channels: { count: (_current, update) => update },
+			// R14：writeTo 的 key 宇宙只来自 stateSchema（channels 不算）
+			stateSchema: Type.Object({ count: Type.Number() }),
 		})
 			.addNode("orphan", fnNode<State>(noop))
 			.addNode("sink", { kind: "llm", name: "", handler: noop })
@@ -221,36 +223,20 @@ describe("compile validation: writeTo (设计 §6.5)", () => {
 		}
 	});
 
-	it("accepts a writeTo key present in the channels universe", () => {
-		const channels: StateSchema<State> = {
-			count: (_current, update) => update,
-		};
-		const graph = minimal({ channels }).addNode("summary", {
-			kind: "llm",
-			name: "",
-			handler: noop,
-			writeTo: "count",
-		});
+	it("never uses channels as the writeTo key universe (R14)", () => {
+		// channels 只列"有自定义 reducer"的 key，不是 State key 全集：无 reducer 的 key
+		// 合法可写（§5.1 直接写入）——channels-only 时宇宙未知，一律跳过校验。
+		const channels: StateSchema<State> = { log: append };
+		for (const writeTo of ["count", "log"]) {
+			const graph = minimal({ channels }).addNode("summary", {
+				kind: "llm",
+				name: "",
+				handler: noop,
+				writeTo,
+			});
 
-		expect(() => graph.compile()).not.toThrow();
-	});
-
-	it("reports a writeTo key absent from the channels universe", () => {
-		const channels: StateSchema<State> = {
-			count: (_current, update) => update,
-		};
-		const graph = minimal({ channels }).addNode("summary", {
-			kind: "llm",
-			name: "",
-			handler: noop,
-			writeTo: "log",
-		});
-
-		const error = captureIssues(() => graph.compile());
-
-		expect(error.issues).toHaveLength(1);
-		expect(error.issues[0]).toContain('"summary"');
-		expect(error.issues[0]).toContain('"log"');
+			expect(() => graph.compile()).not.toThrow();
+		}
 	});
 
 	it("accepts a writeTo key present in the stateSchema properties", () => {
@@ -283,7 +269,7 @@ describe("compile validation: writeTo (设计 §6.5)", () => {
 		expect(error.issues[0]).toContain('"nope"');
 	});
 
-	it("prefers the stateSchema properties over channels when both are given", () => {
+	it("uses the stateSchema universe even when channels list other keys (R14)", () => {
 		const channels: StateSchema<State> = { log: (_current, update) => update };
 		const stateSchema = Type.Object({ count: Type.Number() });
 		const graph = minimal({ channels, stateSchema }).addNode("summary", {
@@ -322,11 +308,22 @@ describe("compile validation: writeTo (设计 §6.5)", () => {
 		expect(() => graph.compile()).not.toThrow();
 	});
 
+	it("skips the writeTo key check when only channels are given (R14)", () => {
+		// channels: { log } 而 writeTo: "count"——count 无自定义 reducer，合法（§5.1）
+		const channels: StateSchema<State> = { log: append };
+		const graph = minimal({ channels }).addNode("summary", {
+			kind: "llm",
+			name: "",
+			handler: noop,
+			writeTo: "count",
+		});
+
+		expect(() => graph.compile()).not.toThrow();
+	});
+
 	it("checks the key of an fn node that declares writeTo", () => {
-		const channels: StateSchema<State> = {
-			count: (_current, update) => update,
-		};
-		const graph = minimal({ channels }).addNode("worker", {
+		const stateSchema = Type.Object({ count: Type.Number() });
+		const graph = minimal({ stateSchema }).addNode("worker", {
 			kind: "fn",
 			name: "",
 			handler: noop,
@@ -369,6 +366,7 @@ describe("compile warnings: unreachable nodes (设计 §6.2, R13)", () => {
 	it("suppresses the whole unreachable check when the graph has any router (R13)", () => {
 		// 设计 §4.2 旗舰示例骨架：extract / gate 的 router 以 Send 动态扇出到
 		// review / precedent_check——router/Send 目标静态不可知，有 router 就放弃可达性检查。
+		// 只给 channels（不给 stateSchema）：writeTo 的 key 校验随之跳过（R14），图的合法性不依赖它。
 		const channels: StateSchema<State> = { log: append };
 		const graph = new StateGraph<State>({ name: "legal-review", channels })
 			.addNode("load_doc", fnNode<State>(noop))
