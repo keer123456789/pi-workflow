@@ -4,7 +4,15 @@
  */
 
 /** 全部 workflow 错误的基类。 */
-export class WorkflowError extends Error {}
+export class WorkflowError extends Error {
+	/**
+	 * 附随的 onEvent 监听器错误（R1，可选）：监听器是调用方代码，它的 bug 不得
+	 * 掩盖主失败（错误身份/消息/cause 全不变），但也不静默——失败路径把首个监听器
+	 * 错误挂到主错误的这个字段上。run 本身成功时，监听器错误本身就是抛出的
+	 * `WorkflowError`（`cause` 同为该错误，见 engine.ts）。
+	 */
+	listenerError?: unknown;
+}
 
 /** compile 期校验失败：一次聚合全部问题（issues）。 */
 export class GraphValidationError extends WorkflowError {

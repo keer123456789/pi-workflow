@@ -20,9 +20,10 @@
  * update key 在 schema 的 properties 内"。开发模式（`NODE_ENV !== "production"`）深冻结
  * 每个实例的输入（§5.1:352，原地冻结、不克隆）。
  *
- * onEvent 监听器异常策略（T10）：监听器是调用方代码，抛错既不改变状态机、也不吞事件；
+ * onEvent 监听器异常策略（T10/R1）：监听器是调用方代码，抛错既不改变状态机、也不吞事件；
  * 首个错误被记住，run_finished 之后以 `WorkflowError`（cause 为原错误）报告。若 run
- * 自身也失败，**主失败优先**（监听器 bug 不得掩盖 NodeExecutionError 的错误身份）。
+ * 自身也失败，**主失败优先**（监听器 bug 不得掩盖 NodeExecutionError 的错误身份），
+ * 但监听器错误不静默：挂到主错误的 `listenerError` 字段上（emitter 对调用方不可达）。
  *
  * 触发规则（§5.4）：普通边目标与 router 字符串结果共享同一去重表（按节点名，保留最早
  * 实例）；Send 实例不去重，input 即 Send 载荷（§5.3）。router 每节点每超步求值一次，
@@ -153,6 +154,7 @@ export async function executeRun<S extends object>(
 	/**
 	 * run_finished 之后的监听器错误报告（T10 策略）：只在 run 本身成功时调用——
 	 * run 失败时主失败优先，监听器错误不得掩盖 NodeExecutionError 的身份（见文件头）。
+	 * `listenerError` 字段与失败路径的附随字段同义（错误本体自身即报告时也带上）。
 	 */
 	const reportListenerError = (): void => {
 		const { threw, error: listenerError } = emitter.listenerError();
@@ -163,7 +165,21 @@ export async function executeRun<S extends object>(
 			`onEvent listener threw: ${messageOf(listenerError)}`,
 		);
 		error.cause = listenerError;
+		error.listenerError = listenerError;
 		throw error;
+	};
+
+	/**
+	 * 失败路径的监听器错误附随（R1）：主失败优先——错误身份、消息、cause 全不变，
+	 * 但监听器的 bug 不静默。emitter 对调用方不可达，故把首个监听器错误挂到主错误的
+	 * `listenerError` 字段上（非对象抛值挂不了，只能保持静默）。
+	 */
+	const attachListenerError = (error: unknown): void => {
+		const { threw, error: listenerError } = emitter.listenerError();
+		if (!threw || typeof error !== "object" || error === null) {
+			return;
+		}
+		(error as { listenerError?: unknown }).listenerError = listenerError;
 	};
 
 	/** 构造实例：分配全局实例序（R2），instanceId = `${name}#${seq}`。 */
@@ -242,6 +258,7 @@ export async function executeRun<S extends object>(
 		);
 	} catch (error) {
 		finishRun(0, "failed");
+		attachListenerError(error);
 		throw error;
 	}
 
@@ -257,10 +274,12 @@ export async function executeRun<S extends object>(
 		if (superstep > recursionLimit) {
 			// 只数"执行过的超步数"：limit 内跑满才越限（§5.1 的 step >= recursionLimit）。
 			finishRun(superstep, "failed");
-			throw new GraphRecursionError(
+			const error = new GraphRecursionError(
 				`recursion limit of ${recursionLimit} supersteps exceeded (attempted superstep ${superstep})`,
 				{ superstep, limit: recursionLimit },
 			);
+			attachListenerError(error);
+			throw error;
 		}
 
 		// (b) 本超步实例并发执行（I/O 并发）。全部 settle 后再决策：
@@ -303,6 +322,7 @@ export async function executeRun<S extends object>(
 			// collateral（被连带取消的兄弟实例）与信号取消是 T11。
 			emitter.emit({ type: "superstep_aborted", superstep });
 			finishRun(superstep, "failed");
+			attachListenerError(failure);
 			throw failure;
 		}
 
@@ -315,6 +335,7 @@ export async function executeRun<S extends object>(
 			// 本超步整体不提交（原子性），InvalidWriteError **原样**传播（不包 NodeExecutionError）。
 			emitter.emit({ type: "superstep_aborted", superstep });
 			finishRun(superstep, "failed");
+			attachListenerError(error);
 			throw error;
 		}
 		state = committed;
@@ -329,6 +350,7 @@ export async function executeRun<S extends object>(
 			// 本超步已提交（superstep_committed 已发），但不再有后续超步——fail-fast 原样抛出。
 			// router 不是节点，不包 NodeExecutionError。
 			finishRun(superstep, "failed");
+			attachListenerError(error);
 			throw error;
 		}
 	}
@@ -485,10 +507,11 @@ function assertInitialState<S extends object>(
 }
 
 /**
- * handler 返回形状（T8 review）：`undefined` / `null` = "没有写入"（合法，空写入表）；
- * 无 `writeTo` 的节点返回数组或原始值不是 `Partial<S>` → TypeError（该值曾静默变
- * no-op）。有 `writeTo` 的节点返回任意值都合法——它就是"写往 writeTo 的单值"
- * （§5.1:354），数组/原始值正是其载荷形态。
+ * handler 返回形状（T8 review / R1）：`undefined` / `null` = "没有写入"（合法，空写入表）；
+ * 无 `writeTo` 的节点必须返回**普通对象**（`Partial<S>`）——数组、原始值、Map/Date/
+ * 类实例等"非普通对象"都曾静默变 no-op（`Object.keys` 拿不到任何写入），掩盖 bug，
+ * 现在一律按节点失败处理。有 `writeTo` 的节点返回值任意形状皆合法——它就是"写往
+ * writeTo 的单值"（§5.1:354），数组/原始值正是其载荷形态。
  */
 function shapeFailureOf(
 	definition: { writeTo?: string },
@@ -500,11 +523,50 @@ function shapeFailureOf(
 	if (definition.writeTo !== undefined) {
 		return undefined;
 	}
-	if (typeof output === "object" && !Array.isArray(output)) {
+	if (
+		typeof output === "object" &&
+		!Array.isArray(output) &&
+		isPlainUpdateRecord(output)
+	) {
 		return undefined;
 	}
-	const kind = Array.isArray(output) ? "an array" : `a ${typeof output}`;
-	return new TypeError(`handler must return Partial<S> object, got ${kind}`);
+	return new TypeError(
+		`handler must return Partial<S> object, got ${describeOutput(output)}`,
+	);
+}
+
+/**
+ * `Partial<S>` 更新表必须是普通对象（原型为 `Object.prototype` 或 `null`）：
+ * Map/Set/Date/RegExp/类实例都是 `typeof "object"` 但不是更新表（R1，与数组同一类
+ * silent no-op）。跨 realm 对象的原型不同，同样按非普通对象处理（M1 不区分）。
+ */
+function isPlainUpdateRecord(value: object): boolean {
+	try {
+		const prototype = Object.getPrototypeOf(value);
+		return prototype === Object.prototype || prototype === null;
+	} catch {
+		// 连取原型都抛错（如 revoked Proxy）：按非法处理，别让裸错误逃出校验路径。
+		return false;
+	}
+}
+
+/** 非法返回值的可读描述（TypeError 消息用）：数组 / 原始值 / 构造器名。 */
+function describeOutput(value: unknown): string {
+	if (Array.isArray(value)) {
+		return "an array";
+	}
+	if (typeof value !== "object" || value === null) {
+		return `a ${typeof value}`;
+	}
+	try {
+		const name: unknown = (value as { constructor?: { name?: unknown } })
+			.constructor?.name;
+		return typeof name === "string" && name !== ""
+			? `a ${name}`
+			: "a non-plain object";
+	} catch {
+		return "a non-plain object";
+	}
 }
 
 /**

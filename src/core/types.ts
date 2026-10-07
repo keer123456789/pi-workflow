@@ -125,6 +125,11 @@ export type ResolvedServices = {
  * committed 边界语义（T10）：**不做**逐事件打标（§8.1 样例的 `committed:false` 在 M1
  * 不落字段）。某超步是否提交看它的事件之后跟随的边界事件——`superstep_committed`
  * 已提交 / `superstep_aborted` 未提交（含失败超步）；消费方按最近边界判定。
+ *
+ * `run_finished.superstep` 语义（R1，与 `GraphRecursionError.superstep` 对齐）：
+ * 实例失败 / 提交失败 / 生成下一批失败 = **已执行**的超步编号；recursionLimit 越限
+ * （本超步未执行）= **尝试**的超步编号（limit + 1）；run 未开始（初始激活的内部
+ * 不变量错误）= 0。
  */
 export type RunEvent =
 	| {

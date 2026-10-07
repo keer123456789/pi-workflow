@@ -420,6 +420,34 @@ describe("handler return shape (T8 review)", () => {
 		expect((error as NodeExecutionError).cause).toBeInstanceOf(TypeError);
 		expect((error as NodeExecutionError).message).toContain("number");
 	});
+
+	it("fails the node for a non-plain object return (Map / Date / class instance)", async () => {
+		type S = { v?: number };
+		class Custom {}
+		const cases: { label: string; value: unknown }[] = [
+			{ label: "Map", value: new Map([["v", 1]]) },
+			{ label: "Date", value: new Date(0) },
+			{ label: "Custom", value: new Custom() },
+		];
+
+		// Map/Date/类实例都是"对象"，但不是 Partial<S> 更新表：Object.keys 拿不到
+		// 任何写入 → 静默 no-op（与数组同一类 bug）。必须按节点失败处理。
+		for (const { label, value } of cases) {
+			const g = new StateGraph<S>()
+				.addNode(
+					"bad",
+					fnNode<S>((() => value) as unknown as NodeHandler<S, S>),
+				)
+				.addEdge(START, "bad")
+				.addEdge("bad", END);
+
+			const error = await captureRejection(run(g, {}));
+
+			expect(error).toBeInstanceOf(NodeExecutionError);
+			expect((error as NodeExecutionError).cause).toBeInstanceOf(TypeError);
+			expect((error as NodeExecutionError).message).toContain(label);
+		}
+	});
 });
 
 describe("failure message rendering (T8 review)", () => {
@@ -550,6 +578,30 @@ describe("writeTo commit semantics (设计 §5.1:354)", () => {
 		expect(ofType(events, "superstep_aborted")).toHaveLength(1);
 	});
 
+	it("treats a writeTo node's undefined/null return as no writes (pin)", async () => {
+		type S = { result?: unknown; marker: number };
+
+		const g = new StateGraph<S>()
+			.addNode(
+				"undef",
+				writeToNode<S, S>("result", () => undefined),
+			)
+			.addNode(
+				"nil",
+				writeToNode<S, S>("result", () => null),
+			)
+			.addEdge(START, "undef")
+			.addEdge(START, "nil")
+			.addEdge("undef", END)
+			.addEdge("nil", END);
+
+		const { state } = await run(g, { marker: 1 });
+
+		// carry 6 的统一规则不豁免 writeTo：undefined/null 仍是"没有写入"
+		expect(state).toEqual({ marker: 1 });
+		expect("result" in state).toBe(false);
+	});
+
 	it("maps writeTo outputs in lastUpdate as well (router sees the single value)", async () => {
 		type S = { result?: string };
 		let routerSaw: Partial<S> | undefined;
@@ -625,7 +677,16 @@ describe("dev-mode input freeze (设计 §5.1:352)", () => {
 		process.env.NODE_ENV = originalEnv;
 	});
 
+	/**
+	 * 显式落到开发模式：冻结语义不能依赖运行环境（R1——套件在 NODE_ENV=production
+	 * 下跑时，这些用例必须仍断言"已冻结"，而不是悄悄变成 no-op 断言）。
+	 */
+	function forceDevMode(): void {
+		process.env.NODE_ENV = "development";
+	}
+
 	it("deep-freezes plain-activation inputs in place; mutation throws in strict mode", async () => {
+		forceDevMode();
 		type S = { nested: { v: number }; list: number[] };
 		let frozenInput = false;
 		let frozenNested = false;
@@ -663,6 +724,7 @@ describe("dev-mode input freeze (设计 §5.1:352)", () => {
 	});
 
 	it("deep-freezes Send payloads too (same reference, no clone)", async () => {
+		forceDevMode();
 		type S = { out?: string };
 		const payload = { value: "p" };
 		let frozenPayload = false;
@@ -693,6 +755,7 @@ describe("dev-mode input freeze (设计 §5.1:352)", () => {
 	});
 
 	it("freezes cyclic inputs without infinite recursion (WeakSet guard)", async () => {
+		forceDevMode();
 		type Cyc = { self?: Cyc };
 		const initial: Cyc = {};
 		initial.self = initial;
@@ -768,6 +831,36 @@ describe("internal invariants: unregistered plain-edge targets (T8 review)", () 
 		expect(ofType(events, "run_finished")[0].status).toBe("failed");
 	});
 
+	it("attaches the listener error to the initial-activation invariant failure", async () => {
+		const listenerBoom = new Error("listener boom");
+		const data: CompiledGraphData<BasicState> = {
+			name: "hand-built",
+			channels: {},
+			nodes: new Map(),
+			plainEdges: new Map([[START, ["ghost"]]]),
+			routers: new Map(),
+			warnings: [],
+		};
+
+		const error = await captureRejection(
+			executeRun(
+				data,
+				{},
+				{
+					onEvent: (e) => {
+						if (e.type === "run_started") {
+							throw listenerBoom;
+						}
+					},
+				},
+				resolveServices(),
+			),
+		);
+
+		expect(error).toBeInstanceOf(WorkflowError);
+		expect((error as WorkflowError).listenerError).toBe(listenerBoom);
+	});
+
 	it("also fires for a mid-graph target (after the superstep committed)", async () => {
 		const events: RunEvent[] = [];
 		const data: CompiledGraphData<BasicState> = {
@@ -803,6 +896,39 @@ describe("internal invariants: unregistered plain-edge targets (T8 review)", () 
 			"run_finished",
 		]);
 		expect(ofType(events, "run_finished")[0].status).toBe("failed");
+	});
+
+	it("attaches the listener error to a next-batch failure (after commit)", async () => {
+		const listenerBoom = new Error("listener boom");
+		const data: CompiledGraphData<BasicState> = {
+			name: "hand-built",
+			channels: {},
+			nodes: new Map([["a", fnNode<BasicState>(() => ({ x: 1 }))]]),
+			plainEdges: new Map([
+				[START, ["a"]],
+				["a", ["ghost"]],
+			]),
+			routers: new Map(),
+			warnings: [],
+		};
+
+		const error = await captureRejection(
+			executeRun(
+				data,
+				{},
+				{
+					onEvent: (e) => {
+						if (e.type === "node_finished") {
+							throw listenerBoom;
+						}
+					},
+				},
+				resolveServices(),
+			),
+		);
+
+		expect(error).toBeInstanceOf(WorkflowError);
+		expect((error as WorkflowError).listenerError).toBe(listenerBoom);
 	});
 });
 
@@ -872,8 +998,9 @@ describe("onEvent listener errors (T8 review)", () => {
 		expect((error as Error).cause).toBe(first);
 	});
 
-	it("does not mask a failing run: the run's own error wins over the listener error", async () => {
+	it("does not mask a failing run; the listener error is attached instead of dropped", async () => {
 		const boom = new Error("boom");
+		const listenerBoom = new Error("listener boom");
 		const g = new StateGraph<BasicState>()
 			.addNode(
 				"bad",
@@ -891,15 +1018,65 @@ describe("onEvent listener errors (T8 review)", () => {
 				{
 					onEvent: (e) => {
 						if (e.type === "node_failed") {
-							throw new Error("listener boom");
+							throw listenerBoom;
 						}
 					},
 				},
 			),
 		);
 
-		// 主失败优先：监听器 bug 不得抹掉 NodeExecutionError 的错误身份
+		// 主失败优先：错误身份、消息、cause 都不被监听器 bug 抹掉
 		expect(error).toBeInstanceOf(NodeExecutionError);
 		expect((error as NodeExecutionError).cause).toBe(boom);
+		// ……但监听器错误也不静默：附随在主错误上（R1）
+		expect((error as WorkflowError).listenerError).toBe(listenerBoom);
+	});
+
+	it("attaches the listener error to a commit-phase failure too", async () => {
+		const listenerBoom = new Error("listener boom");
+		const g = racingWriters(
+			() => ({ x: 1 }),
+			() => ({ x: 2 }),
+		);
+
+		const error = await captureRejection(
+			run(
+				g,
+				{},
+				{
+					onEvent: (e) => {
+						if (e.type === "node_finished") {
+							throw listenerBoom;
+						}
+					},
+				},
+			),
+		);
+
+		expect(error).toBeInstanceOf(InvalidWriteError);
+		expect((error as WorkflowError).listenerError).toBe(listenerBoom);
+	});
+
+	it("attaches the listener error to a recursion-limit failure", async () => {
+		const counter = { runs: 0 };
+		const listenerBoom = new Error("listener boom");
+
+		const error = await captureRejection(
+			run(
+				selfLoop(counter),
+				{},
+				{
+					recursionLimit: 1,
+					onEvent: (e) => {
+						if (e.type === "node_finished") {
+							throw listenerBoom;
+						}
+					},
+				},
+			),
+		);
+
+		expect(error).toBeInstanceOf(GraphRecursionError);
+		expect((error as WorkflowError).listenerError).toBe(listenerBoom);
 	});
 });
