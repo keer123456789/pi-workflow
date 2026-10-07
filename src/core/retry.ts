@@ -52,23 +52,24 @@ export function markRetryable<T extends Error>(error: T): T {
  * 命中正则族。**永不抛**（见模块注释）。
  */
 export function isRetryableError(error: unknown): boolean {
-	if (
-		(typeof error === "object" && error !== null) ||
-		typeof error === "function"
-	) {
-		const record = error as Record<PropertyKey, unknown>;
-		if (record[RETRYABLE] === true) {
-			return true;
-		}
-		if (record.code === RETRYABLE_CODE) {
-			return true;
-		}
-	}
 	try {
+		if (
+			(typeof error === "object" && error !== null) ||
+			typeof error === "function"
+		) {
+			const record = error as Record<PropertyKey, unknown>;
+			if (record[RETRYABLE] === true) {
+				return true;
+			}
+			if (record.code === RETRYABLE_CODE) {
+				return true;
+			}
+		}
 		return RETRYABLE_MESSAGE.test(messageTextOf(error));
 	} catch {
-		// 极端抛值（null 原型 + 抛错的 toString/valueOf）：没有可读文本可用——
-		// 按"不可重试"保守处理；分类本身绝不让引擎的失败分支崩掉。
+		// 属性读取（抛错 getter / Proxy get trap）与文本渲染（null 原型 + 抛错的
+		// toString/valueOf）都在 try 内：任一路径抛错 → 按"不可重试"保守处理。
+		// "本函数永不抛"是硬不变量——分类绝不让引擎的失败分支崩掉。
 		return false;
 	}
 }

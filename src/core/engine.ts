@@ -1073,7 +1073,8 @@ async function executeInstance<S extends object>(args: {
 		// reject ECONNRESET、客户端 CanceledError 这类 §7.2 的真实瞬态错误）。不发
 		// node_failed、不重试，交给调用方记进 collateral，也不参与根因选举（T10 的实例序
 		// 选举只在"未被取消"的失败之间进行）。节点自身内部的 AbortError（嵌套请求超时）
-		// 不受影响：实例信号没有取消，它仍是可重试失败（§7.2 的 timeout 类）。
+		// 不再无条件可重试——其是否重试由 D3 分类决定（消息落在族内，如含 "timed out"，
+		// 仍可重试；分类判不可重试则与普通错误一样立即失败）。
 		if (instanceSignal.aborted) {
 			throw new InstanceCancelledError(instance.instanceId);
 		}
