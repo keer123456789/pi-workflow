@@ -258,7 +258,7 @@ const { state, runId } = await app.run(initialState, {
   maxTotalInstances?: number;         // 默认 10000；整次 run 实例总数硬上限
   runTimeoutMs?: number;              // 默认无；run 级超时
   signal?: AbortSignal;               // 外部取消（工作台"停止"按钮）
-  onEvent?: (e: RunEvent) => void;    // 实时事件流；顺序保证见 §8.2
+  onEvent?: (e: RunEvent) => void;    // 实时事件流；顺序保证见 §8.1
   logDir?: string;                    // 默认 PI_WORKFLOW_LOG_DIR ?? ".pi-workflow/runs"（§8/D2）
   logOutputs?: "full" | "hash";       // 默认 "full"；"hash" 时 input/output 只记 SHA-256（§8.1/D7）
   onLogError?: "fail" | "warn";       // 默认 "fail"（法律审计场景日志不可静默丢失）——日志写失败使 run 拒绝（§8.1/D8）
@@ -469,7 +469,7 @@ for step in 0..:
 {"ts":"...","seq":1,"type":"run_started","runId":"...","graph":"contract-review","superstep":0,"input":{...}}
 {"ts":"...","seq":3,"type":"node_started","runId":"...","superstep":2,"node":"review","instanceId":"review#7","kind":"llm","input":{...}}
 {"ts":"...","seq":8,"superstep":2,"type":"node_retry","runId":"...","node":"review","instanceId":"review#7","attempt":1,"error":"429 rate limit"}
-{"ts":"...","seq":9,"type":"node_finished","runId":"...","superstep":2,"instanceId":"review#7","output":{...},"usage":{"input":1000,"output":234,"cacheRead":0,"cacheWrite":0,"totalTokens":1234},"durationMs":4200}
+{"ts":"...","seq":9,"type":"node_finished","runId":"...","superstep":2,"node":"review","instanceId":"review#7","output":{...},"usage":{"input":1000,"output":234,"cacheRead":0,"cacheWrite":0,"totalTokens":1234},"durationMs":4200}
 {"ts":"...","seq":12,"type":"superstep_committed","runId":"...","superstep":2}
 {"ts":"...","type":"run_finished","runId":"...","status":"completed|failed","durationMs":...}
 ```
@@ -480,7 +480,7 @@ for step in 0..:
 - `node_finished.usage?`（D11）：成功尝试经 `ctx.reportUsage` 上报的用量（按 attempt 取末次）；未上报时字段缺省，失败/重试的尝试不产生 usage；
 - 事件同时经 `onEvent` 实时发出：**顺序保证 = 完成序（实时性优先）**，字段 `seq` 供需要全序的消费者（重放、审计）重排；
 - **脱敏（`logOutputs: "hash"`，D7）**：`run_started.input`、`node_started.input`、`node_finished.output` 三字段替换为字符串 `"sha256:<64位hex>"`（`sha256(JSON.stringify(value))`；stringify 抛错时对 `"[unserializable]"` 取哈希）——**onEvent 与日志文件两路都拿脱敏后的事件**（避免全文经回调泄露，法律文书敏感）；
-- 日志写失败：默认 `onLogError: "fail"` 使 run 失败（审计要求），可配 `"warn"` 降级（详见 §4.4 的 D8 说明）；
+- **日志写失败（D8）**：默认 `onLogError: "fail"`——logger 任一钩子抛错使 run 以 `WorkflowError("run log write failed: <原因>")` 拒绝、`cause` 附原错，含收尾阶段（`run_finished` 已发后 `onRunFinish` 抛错同样拒绝；审计要求）；`"warn"` 的确切降级行为 = `console.warn("pi-workflow: run log write failed: <原因>")` 并继续；**预检失败**（初始 state 校验 / 已 abort 的 signal）的 run 不创建日志；
 - 日志是 v2 断点续跑的数据基础（事件溯源 + seq 重放）。
 
 ---
