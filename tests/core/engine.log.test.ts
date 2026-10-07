@@ -119,6 +119,20 @@ function ofType<T extends RunEvent["type"]>(
 	>[];
 }
 
+/**
+ * "不可打印"的抛值（R2）：null 原型（`String(value)` → TypeError）+ 抛错的 `toJSON`
+ * （`JSON.stringify(value)` → 抛）——`messageOf` 的两条渲染路都会抛，修前异常会从
+ * `emitter.emit` 逃逸。注意**纯** `Object.create(null)` 不触发这条路径：
+ * JSON.stringify 返回 `"{}"`，渲染成功（测试里两种值都覆盖）。
+ */
+function unprintableThrown(): unknown {
+	const value = Object.create(null) as Record<string, unknown>;
+	value.toJSON = () => {
+		throw new Error("no json");
+	};
+	return value;
+}
+
 describe("engine × run log (D2/D7/D8/D9)", () => {
 	it("writes run_started / node events / run_finished to the default JSONL when logDir is provided", async () => {
 		const dir = makeTempRoot();
@@ -434,6 +448,77 @@ describe("engine × run log (D2/D7/D8/D9)", () => {
 		);
 		for (const call of warn.mock.calls) {
 			expect(call[0]).toMatch(/^pi-workflow: run log write failed: /);
+		}
+	});
+
+	it("onLogError 'fail' still rejects with the D8 message when the thrown value is unprintable", async () => {
+		// R2：不可打印的抛值不得让异常从 emit 逃逸（那会绕过整个 D8 消息面）。
+		for (const [thrown, expected] of [
+			// 纯 Object.create(null)：JSON.stringify 出 "{}"，渲染得了（不进兜底）
+			[Object.create(null), "run log write failed: {}"],
+			// null 原型 + 抛错的 toJSON：JSON.stringify 与 String() **两条渲染路都抛** → 兜底文本
+			[unprintableThrown(), "run log write failed: [unprintable error]"],
+		] as const) {
+			const logger: RunLogger = {
+				onEvent: () => {
+					throw thrown;
+				},
+			};
+
+			const error = await captureRejection(
+				twoNodeGraph().compile({ services: { logger } }).run({ v: 0 }),
+			);
+
+			// (a) fail 策略：仍以带前缀的 WorkflowError 拒绝（不外泄裸错）……
+			expect(error).toBeInstanceOf(WorkflowError);
+			expect((error as Error).message).toBe(expected);
+			expect((error as Error).cause).toBe(thrown);
+		}
+	});
+
+	it("onLogError 'warn' warns with the fallback text and keeps running for unprintable throws", async () => {
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const thrown = unprintableThrown();
+		const logger: RunLogger = {
+			onEvent: () => {
+				throw thrown;
+			},
+		};
+
+		const result = await twoNodeGraph()
+			.compile({ services: { logger } })
+			.run({ v: 0 }, { onLogError: "warn" });
+
+		// (b) warn 策略：照常 warn + 继续，run 不受影响
+		expect(result.state).toEqual({ v: 2 });
+		expect(warn.mock.calls[0][0]).toBe(
+			"pi-workflow: run log write failed: [unprintable error]",
+		);
+	});
+
+	it("falls back past an empty logDir to the env / default directory (never cwd)", async () => {
+		const dir = makeTempRoot();
+		const previous = process.env.PI_WORKFLOW_LOG_DIR;
+		process.env.PI_WORKFLOW_LOG_DIR = dir;
+		try {
+			// R2：`logDir: ""` 是空相对路径（会落到 cwd）——与 null/undefined 一样回落下一级
+			const { runId } = await twoNodeGraph()
+				.compile()
+				.run({ v: 0 }, { logDir: "" });
+
+			const lines = parseJsonl(findRunFile(dir, runId));
+			expect(lines[0]).toMatchObject({ type: "run_started", runId });
+			expect(lines.at(-1)).toMatchObject({
+				type: "run_finished",
+				status: "completed",
+				runId,
+			});
+		} finally {
+			if (previous === undefined) {
+				delete process.env.PI_WORKFLOW_LOG_DIR;
+			} else {
+				process.env.PI_WORKFLOW_LOG_DIR = previous;
+			}
 		}
 	});
 

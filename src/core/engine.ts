@@ -156,6 +156,9 @@ const DEFAULT_LOG_DIR = ".pi-workflow/runs";
  */
 const LOG_FAILURE_PREFIX = "run log write failed: ";
 
+/** 不可打印抛值的兜底文本（R2）：D8 的消息面在极端输入下也必须成立，绝不因它再抛。 */
+const UNPRINTABLE_ERROR_TEXT = "[unprintable error]";
+
 /** 待执行实例；input 是激活时刻 state 的只读快照（普通触发，设计 §5.1）。 */
 type Instance = {
 	node: string;
@@ -323,10 +326,14 @@ async function runGraph<S extends object>(
 	const onLogError = resolveOnLogError(options.onLogError);
 	// 日志装配（D2）：`services.logger !== undefined` → 原样使用（`{}` = 钩子全缺省 =
 	// 全静默）；否则用内置 JSONL 实现——目录**每次 run** 解析（见 DEFAULT_LOG_DIR）。
+	// `logger: null`（JS 调用方）经 `??` 视同 undefined → 用默认实现：R2 的 `!== undefined`
+	// 口径在 null 上从宽处理，属有意为之（null 不是"显式关闭"的第三种写法）。
 	const logger: RunLogger =
 		services.logger ??
 		createJsonlLogger({
-			dir: options.logDir ?? process.env.PI_WORKFLOW_LOG_DIR ?? DEFAULT_LOG_DIR,
+			// 目录链（D2/R2）：空串同样回落下一级——`logDir: ""` 或 `PI_WORKFLOW_LOG_DIR=""`
+			// 不得把日志建到 cwd（空相对路径会落到当前工作目录）。
+			dir: options.logDir || process.env.PI_WORKFLOW_LOG_DIR || DEFAULT_LOG_DIR,
 			runId,
 			ts: startedAt,
 		});
@@ -1292,10 +1299,19 @@ function resolveOnLogError(
  * 自定义 logger 抛出的任意错误则补上同一前缀一次，让 fail/warn 两条路径的可见消息与
  * 文档一致（`WorkflowError("run log write failed: …")` /
  * `console.warn("pi-workflow: run log write failed: …")`）。渲染沿用 messageOf
- * （非 Error 的抛值也能出可读文本）。
+ * （非 Error 的抛值也能出可读文本）；**本函数永不抛**（R2）——messageOf 自身对
+ * "不可打印"的抛值（见 catch 注释）也会抛，这里兜住，任何裸错都不得逃出 emit。
  */
 function logFailureMessage(error: unknown): string {
-	const text = messageOf(error);
+	let text: string;
+	try {
+		text = messageOf(error);
+	} catch {
+		// **本函数绝不抛**（R2）：极端的抛值（null 原型 + 抛错的 toJSON——JSON.stringify 与
+		// String() 两条渲染路都抛）会让 messageOf 再抛；D8 的拒绝体/告警文本若因此逃逸出
+		// emitter.emit，就绕过了整个失败策略。回落固定兜底文本。
+		text = UNPRINTABLE_ERROR_TEXT;
+	}
 	return text.startsWith(LOG_FAILURE_PREFIX)
 		? text
 		: `${LOG_FAILURE_PREFIX}${text}`;
