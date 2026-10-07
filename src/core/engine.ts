@@ -96,8 +96,13 @@
 
 import { Value } from "typebox/value";
 
-import { createEmitter, type RunEmitter } from "../log/emitter.js";
+import {
+	createEmitter,
+	type RunEmitter,
+	type RunEventInput,
+} from "../log/emitter.js";
 import { createJsonlLogger, type RunLogger } from "../log/runlog.js";
+import type { TokenUsage } from "../runtime/executor.js";
 import {
 	GraphRecursionError,
 	GraphValidationError,
@@ -999,12 +1004,19 @@ async function executeInstance<S extends object>(args: {
 			instanceSignal,
 			attemptController.signal,
 		]);
+		// 用量记录槽（D11）：**每次尝试开始时重置**——上一次（失败/重试）尝试的上报不残留，
+		// 本次尝试内 handler 多次上报取**最后一次**。只有成功尝试的槽值会挂进
+		// node_finished.usage；失败/取消的尝试不产生 usage（槽随尝试一起丢弃）。
+		let attemptUsage: TokenUsage | undefined;
 		const ctx: NodeContext = {
 			runId,
 			superstep,
 			instanceId: instance.instanceId,
 			seq: instance.seq,
 			signal: attemptSignal,
+			reportUsage: (usage) => {
+				attemptUsage = usage;
+			},
 		};
 
 		const outcome = await raceAttempt({
@@ -1033,14 +1045,21 @@ async function executeInstance<S extends object>(args: {
 				}
 				fail(shapeError);
 			}
-			emitter.emit({
+			// 用量挂钩（D11）：**条件构建**——只有成功尝试上报过时才带 `usage` 键，
+			// 未上报的事件上连键都没有（`usage: undefined` 会进 JSONL，语义不同）。
+			const finished: RunEventInput = {
 				type: "node_finished",
 				superstep,
 				node: instance.node,
 				instanceId: instance.instanceId,
 				output,
 				durationMs: elapsedMs(services, startedAt),
-			});
+			};
+			emitter.emit(
+				attemptUsage === undefined
+					? finished
+					: { ...finished, usage: attemptUsage },
+			);
 			return { instance, update: updateOf(definition, output) };
 		}
 

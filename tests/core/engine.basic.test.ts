@@ -26,12 +26,14 @@ import {
 	type CompiledGraph,
 	type CompiledGraphData,
 	END,
+	type NodeDefinition,
 	type RunEvent,
 	type RunOptions,
 	type RunResult,
 	START,
 } from "../../src/core/types.js";
 import { fnNode } from "../../src/nodes/fn.js";
+import type { TokenUsage } from "../../src/runtime/executor.js";
 
 /** 任务 brief 的 `g.run(...)` 简写：编译（无参）后跑一次。 */
 function run<S extends object>(
@@ -496,5 +498,187 @@ describe("engine: wiring", () => {
 		expect(first.runId).toBeTruthy();
 		expect(first.runId).not.toBe(second.runId);
 		expect(second.state.v).toBe(1);
+	});
+});
+
+describe("engine: usage propagation (D11)", () => {
+	/** 一份含 cost 的完整用量（深等断言用；每次新建避免共享引用掩盖别名问题）。 */
+	function usageOf(input: number, output: number): TokenUsage {
+		return {
+			input,
+			output,
+			cacheRead: 1,
+			cacheWrite: 2,
+			totalTokens: input + output + 3,
+			cost: {
+				input: 0.01,
+				output: 0.02,
+				cacheRead: 0,
+				cacheWrite: 0,
+				total: 0.03,
+			},
+		};
+	}
+
+	/** 只报告并失败/成功的可重试节点（429 属 D3 可重试类，任务 5/6 收紧分类后本测试照旧走重试）。 */
+	function retryableNode(
+		handler: NodeDefinition<{ v?: number }>["handler"],
+	): NodeDefinition<{ v?: number }> {
+		return { kind: "fn", name: "", retry: { maxAttempts: 2 }, handler };
+	}
+
+	/** 注入立即返回的 sleep/random：重试退避不产生真实等待，时序不依赖墙钟。 */
+	function compileWithFastRetry(g: StateGraph<{ v?: number }>) {
+		return g.compile({
+			services: {
+				sleep: async () => {},
+				random: () => 0.5,
+			},
+		});
+	}
+
+	it("attaches the usage reported by the handler to node_finished", async () => {
+		const usage = usageOf(10, 5);
+		const events: RunEvent[] = [];
+		let seenReportUsage: unknown;
+
+		const g = new StateGraph<{ v?: number }>()
+			.addNode(
+				"a",
+				fnNode<{ v?: number }>((_input, ctx) => {
+					seenReportUsage = ctx.reportUsage;
+					ctx.reportUsage?.(usage);
+					return { v: 1 };
+				}),
+			)
+			.addEdge(START, "a")
+			.addEdge("a", END);
+
+		await run(g, {}, { onEvent: (e) => events.push(e) });
+
+		// 引擎**总是**提供回调（声明可选只是给手工组装 ctx 的调用方留余地）
+		expect(typeof seenReportUsage).toBe("function");
+		const finished = ofType(events, "node_finished");
+		expect(finished).toHaveLength(1);
+		expect(finished[0].usage).toEqual(usage);
+	});
+
+	it("keeps the last report when the handler reports more than once in one attempt", async () => {
+		const first = usageOf(1, 1);
+		const last = usageOf(9, 9);
+		const events: RunEvent[] = [];
+
+		const g = new StateGraph<{ v?: number }>()
+			.addNode(
+				"a",
+				fnNode<{ v?: number }>((_input, ctx) => {
+					ctx.reportUsage?.(first);
+					ctx.reportUsage?.(last);
+					return { v: 1 };
+				}),
+			)
+			.addEdge(START, "a")
+			.addEdge("a", END);
+
+		await run(g, {}, { onEvent: (e) => events.push(e) });
+
+		// 按 attempt 记录、最后一次生效（D11）——不累加、不取首次
+		expect(ofType(events, "node_finished")[0].usage).toEqual(last);
+	});
+
+	it("keeps only the successful attempt's usage, dropping the failed attempt's report", async () => {
+		const usageA = usageOf(1, 1);
+		const usageB = usageOf(3, 4);
+		const events: RunEvent[] = [];
+		let attempts = 0;
+
+		const g = new StateGraph<{ v?: number }>()
+			.addNode(
+				"flaky",
+				retryableNode((_input, ctx) => {
+					attempts += 1;
+					if (attempts === 1) {
+						ctx.reportUsage?.(usageA);
+						throw new Error("429 rate limit");
+					}
+					ctx.reportUsage?.(usageB);
+					return { v: 1 };
+				}),
+			)
+			.addEdge(START, "flaky")
+			.addEdge("flaky", END);
+
+		await compileWithFastRetry(g).run({}, { onEvent: (e) => events.push(e) });
+
+		expect(attempts).toBe(2);
+		expect(ofType(events, "node_retry")).toHaveLength(1);
+		const finished = ofType(events, "node_finished");
+		expect(finished).toHaveLength(1);
+		// 只有成功尝试（第二 attempt）的用量——失败尝试的 A 不残留、不合并
+		expect(finished[0].usage).toEqual(usageB);
+	});
+
+	it("omits usage when the failed attempt reported but the successful one did not", async () => {
+		const events: RunEvent[] = [];
+		let attempts = 0;
+
+		const g = new StateGraph<{ v?: number }>()
+			.addNode(
+				"flaky",
+				retryableNode((_input, ctx) => {
+					attempts += 1;
+					if (attempts === 1) {
+						ctx.reportUsage?.(usageOf(1, 1));
+						throw new Error("429 rate limit");
+					}
+					return { v: 1 };
+				}),
+			)
+			.addEdge(START, "flaky")
+			.addEdge("flaky", END);
+
+		await compileWithFastRetry(g).run({}, { onEvent: (e) => events.push(e) });
+
+		// 每次 attempt 开始时重置记录槽：失败尝试的上报不会漏进成功尝试的事件
+		const finished = ofType(events, "node_finished");
+		expect(finished).toHaveLength(1);
+		expect(Object.hasOwn(finished[0], "usage")).toBe(false);
+	});
+
+	it("omits the usage key entirely when the handler never reports", async () => {
+		const events: RunEvent[] = [];
+
+		await run(basic(), {}, { onEvent: (e) => events.push(e) });
+
+		const finished = ofType(events, "node_finished");
+		expect(finished).toHaveLength(1);
+		// 未上报 = 字段缺省（不是 `usage: undefined`）
+		expect(Object.hasOwn(finished[0], "usage")).toBe(false);
+	});
+
+	it("never leaks usage from failed attempts into any event (retries exhausted)", async () => {
+		const events: RunEvent[] = [];
+
+		const g = new StateGraph<{ v?: number }>()
+			.addNode(
+				"always",
+				retryableNode((_input, ctx) => {
+					// 失败尝试也上报：不得出现在 node_started / node_retry / node_failed 上
+					ctx.reportUsage?.(usageOf(1, 1));
+					throw new Error("429 rate limit");
+				}),
+			)
+			.addEdge(START, "always")
+			.addEdge("always", END);
+
+		await captureRejection(
+			compileWithFastRetry(g).run({}, { onEvent: (e) => events.push(e) }),
+		);
+
+		expect(ofType(events, "node_finished")).toHaveLength(0);
+		expect(ofType(events, "node_failed")).toHaveLength(1);
+		expect(ofType(events, "node_retry")).toHaveLength(1);
+		// 没有任何事件带 usage 键（失败尝试不产生 usage）
+		expect(events.filter((e) => Object.hasOwn(e, "usage"))).toEqual([]);
 	});
 });
