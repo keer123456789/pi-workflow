@@ -682,3 +682,70 @@ describe("engine: usage propagation (D11)", () => {
 		expect(events.filter((e) => Object.hasOwn(e, "usage"))).toEqual([]);
 	});
 });
+
+// ---------------------------------------------------------------------------
+// Task 8：llm 节点端到端——compile 期解析 services.complete 并绑定（§6.6/D12），
+// 引擎负责 writeTo 包装（§5.1:354）与 node_finished（§8）。
+// ---------------------------------------------------------------------------
+
+import { Type } from "typebox";
+
+import { llmNode } from "../../src/nodes/llm.js";
+import type { CompleteFn } from "../../src/runtime/executor.js";
+
+describe("engine: llm node end-to-end (Task 8, §4.3/§6.6)", () => {
+	it("runs an llm node bound via services.complete: prompt interpolation, writeTo wrapping, node_finished", async () => {
+		type LlmState = { count: number; summary: string[] };
+		const events: RunEvent[] = [];
+		const calls: string[] = [];
+		const usage: TokenUsage = {
+			input: 10,
+			output: 4,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 14,
+		};
+		const complete: CompleteFn = async (req) => {
+			calls.push(req.prompt);
+			return { text: '["draft"]', usage };
+		};
+
+		const g = new StateGraph<LlmState>()
+			.addNode(
+				"summarise",
+				llmNode<LlmState, "summary">({
+					prompt: "summarise {count} clauses",
+					schema: Type.Array(Type.String()),
+					writeTo: "summary",
+				}),
+			)
+			.addEdge(START, "summarise")
+			.addEdge("summarise", END);
+
+		const compiled = g.compile({ services: { complete } });
+		const { state } = await compiled.run(
+			{ count: 2, summary: [] },
+			{ onEvent: (event) => events.push(event) },
+		);
+
+		// 实例输入经模板插值进 prompt，交给 compile 期解析出的 complete
+		expect(calls).toEqual(["summarise 2 clauses"]);
+		// handler 返回解析值本身，`{ [writeTo]: 值 }` 的包裹由引擎完成（§5.1:354）
+		expect(state.summary).toEqual(["draft"]);
+
+		const started = ofType(events, "node_started");
+		expect(started).toHaveLength(1);
+		expect(started[0]).toMatchObject({ node: "summarise", kind: "llm" });
+
+		const finished = ofType(events, "node_finished");
+		expect(finished).toHaveLength(1);
+		// output = handler 的返回值（解析值本身）——不是包裹后的写入表
+		expect(finished[0]).toMatchObject({
+			node: "summarise",
+			instanceId: "summarise#1",
+			output: ["draft"],
+		});
+		// D11：complete 报的 usage 经 ctx.reportUsage 挂上成功的 node_finished
+		expect(finished[0].usage).toEqual(usage);
+	});
+});

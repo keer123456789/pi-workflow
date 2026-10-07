@@ -10,11 +10,17 @@
  *   compile 照常返回；
  * - compile 成功即封印 builder：后续 addNode/addEdge/addConditionalEdges 抛
  *   `GraphSealedError`（§6.8）。封印是纯标志位——不 freeze 数据、节点或调用方对象（R11）；
- * - compile 期把可选 services 归一为必填 ResolvedServices（R3），run/invoke 接引擎（executeRun）。
+ * - compile 期把可选 services 归一为必填 ResolvedServices（R3），run/invoke 接引擎（executeRun）；
+ * - compile 期解析 llm 节点的补全实现（§6.6/D12）：`def.complete ?? services.complete ??
+ *   pi-ai 默认（可用时）`——解析结果绑定进 `CompiledGraphData.nodes` 的**定义副本**
+ *   （bindLlmNode，Task 6）；三级全缺、非 llm 节点声明 `complete` 都是校验错误（全量收集）。
  */
 
 import type { TSchema } from "typebox";
 
+import { bindLlmNode } from "../nodes/llm.js";
+import type { CompleteFn } from "../runtime/executor.js";
+import { defaultPiAiComplete, isPiAiAvailable } from "../runtime/llm-pi-ai.js";
 import { executeRun, resolveServices } from "./engine.js";
 import { GraphSealedError, GraphValidationError } from "./errors.js";
 import { type StateSchema, stateKeyUniverse } from "./state.js";
@@ -28,6 +34,7 @@ import {
 	type Router,
 	type RunHandle,
 	type RunOptions,
+	type Services,
 	START,
 } from "./types.js";
 
@@ -110,14 +117,31 @@ export class StateGraph<S extends object> {
 	}
 
 	compile(opts?: CompileOptions): CompiledGraph<S> {
+		// §6.6/D12：llm 补全解析先于校验——collectIssues 与 nodes 绑定共用同一份结果
+		// （探测/取默认实现在每次 compile 里只发生一次，见 resolveLlmCompletions）。
+		const completions = resolveLlmCompletions(this.nodes, opts?.services);
 		// 全量校验：一次报完，绝不 fail-fast（设计 §6）。
-		const issues = this.collectIssues();
+		const issues = this.collectIssues(completions);
 		if (issues.length > 0) {
 			throw new GraphValidationError("graph invalid", { issues });
 		}
 		// 只有校验通过才算"编译成功"——此时才有产物需要保持不可变（§6.8）。
 		// 校验失败不封印：调用方要能改完图再 compile。
 		this.sealed = true;
+
+		// 节点表拷贝（D12）：llm 节点在**副本**上绑定真正的 handler——工厂把待绑定配置
+		// 挂在定义对象与 handler 上，而 addNode 存的副本共享 handler 引用，按副本查得到
+		// （src/nodes/llm.ts 的 WeakMap 双键）。绑定产出新对象：构建器注册表与调用方
+		// 持有的定义都不被改写。
+		// biome-ignore lint/suspicious/noExplicitAny: 与 CompiledGraphData.nodes 同口径（注册表里 I 泛型已擦除）
+		const nodes = new Map<string, NodeDefinition<S, any>>();
+		for (const [name, def] of this.nodes) {
+			const complete = def.kind === "llm" ? completions.get(name) : undefined;
+			nodes.set(
+				name,
+				complete === undefined ? def : bindLlmNode(def, complete),
+			);
+		}
 
 		// 装配图数据：与构建器状态解耦（拷贝），后续 addXxx 不影响已 compile 的产物。
 		const plainEdges = new Map<string, string[]>();
@@ -130,7 +154,7 @@ export class StateGraph<S extends object> {
 			// stateSchema 按引用共享，但不 freeze、不修改（对象归调用方所有）。
 			channels: { ...this.channels },
 			stateSchema: this.stateSchema,
-			nodes: new Map(this.nodes),
+			nodes,
 			plainEdges,
 			routers: new Map(this.routers),
 			warnings: this.collectWarnings(),
@@ -169,8 +193,14 @@ export class StateGraph<S extends object> {
 		}
 	}
 
-	/** compile 期错误（设计 §6.1/§6.2/§6.5）：全量收集，顺序即报错顺序。 */
-	private collectIssues(): string[] {
+	/**
+	 * compile 期错误（设计 §6.1/§6.2/§6.5/§6.6）：全量收集，顺序即报错顺序。
+	 * `completions` 是 llm 节点的补全解析结果（compile 在调用前算好，见
+	 * resolveLlmCompletions）——表里没有该节点的名字 = 三级解析全缺。
+	 */
+	private collectIssues(
+		completions: ReadonlyMap<string, CompleteFn>,
+	): string[] {
 		const issues: string[] = [];
 
 		// §6.1：边/router 引用的节点必须已注册。
@@ -273,6 +303,26 @@ export class StateGraph<S extends object> {
 			}
 		}
 
+		// §6.6/D12：`complete` 是 llm 专用。其他 kind 声明它 = 作者错误（注入写错了位置，
+		// 静默忽略会掩盖）；llm 节点的补全在 resolveLlmCompletions 里解析，解析不出
+		// （节点级 / services / pi-ai 三级全缺）在这里报硬错误——把"llm node is not bound"
+		// 的运行期爆炸提前到 compile（§9.4：未注入 complete 且 pi-ai 不可用 → compile 报错）。
+		for (const [name, def] of this.nodes) {
+			if (def.kind === "llm") {
+				if (!completions.has(name)) {
+					issues.push(
+						`node "${name}" (kind "llm") has no completion implementation: declare complete on the node, pass services.complete to compile(), or install @earendil-works/pi-ai (npm i @earendil-works/pi-ai) to use the default pi-ai completion`,
+					);
+				}
+				continue;
+			}
+			if (def.complete !== undefined) {
+				issues.push(
+					`node "${name}" (kind "${def.kind}") must not declare complete: it is only supported on kind "llm" nodes`,
+				);
+			}
+		}
+
 		return issues;
 	}
 
@@ -329,4 +379,40 @@ export class StateGraph<S extends object> {
 /** add-time 校验失败：单条 issue 也走 GraphValidationError（设计 §6.4）。 */
 function singleIssue(issue: string): GraphValidationError {
 	return new GraphValidationError(issue, { issues: [issue] });
+}
+
+/**
+ * llm 补全解析（§6.6/D12）：`def.complete ?? services.complete ?? pi-ai 默认（可用时）`。
+ *
+ * 返回"节点名 → 生效的补全实现"（**只收解析成功的 llm 节点**；解析失败的 llm 节点
+ * 不在表里，collectIssues 据此报 issue）。非 llm 节点不入表。
+ *
+ * 探测闸门：`isPiAiAvailable()` 只在"某个 llm 节点两级都没给 complete"时才调用，
+ * 且每次 compile 至多一次；默认实现也在本次解析里只取一次（defaultPiAiComplete 本身
+ * 是懒建单例，这里再保证同一份结果发给所有 llm 节点）。
+ */
+function resolveLlmCompletions<S extends object>(
+	nodes: Map<string, NodeDefinition<S, unknown>>,
+	services: Services | undefined,
+): Map<string, CompleteFn> {
+	const resolved = new Map<string, CompleteFn>();
+	let piAiDefault: CompleteFn | undefined;
+	let probed = false;
+	for (const [name, def] of nodes) {
+		if (def.kind !== "llm") {
+			continue;
+		}
+		let complete = def.complete ?? services?.complete;
+		if (complete === undefined) {
+			if (!probed) {
+				probed = true;
+				piAiDefault = isPiAiAvailable() ? defaultPiAiComplete() : undefined;
+			}
+			complete = piAiDefault;
+		}
+		if (complete !== undefined) {
+			resolved.set(name, complete);
+		}
+	}
+	return resolved;
 }

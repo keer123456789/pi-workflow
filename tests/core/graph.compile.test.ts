@@ -682,3 +682,222 @@ describe("compile: valid graphs (name precedence)", () => {
 		expect(named.compile({ name: "opts" }).name).toBe("opts");
 	});
 });
+
+// ---------------------------------------------------------------------------
+// Task 8：compile 期补全解析与绑定（§6.6/D12）
+//
+// 可用性由 `vi.mock("../../src/runtime/llm-pi-ai.js")` 控制（T7 review 要求在本任务覆盖
+// "对等依赖未安装"的 false 路径）：mock 默认 available = true，与"pi-ai 真的装在
+// devDependencies 里"的真实探测一致——本文件此前的用例行为不变；不可用路径逐例显式置
+// false 并在 finally 复位。本节整体追加在文件末尾：vi.mock / vi.hoisted 由 vitest 提升、
+// import 由 ESM 提升，位置不影响语义。
+// ---------------------------------------------------------------------------
+
+import { vi } from "vitest";
+
+import type { CompileOptions, RunEvent } from "../../src/core/types.js";
+import { llmNode } from "../../src/nodes/llm.js";
+import type { CompleteFn } from "../../src/runtime/executor.js";
+import { defaultPiAiComplete } from "../../src/runtime/llm-pi-ai.js";
+
+/** 假 llm-pi-ai 模块的状态（vi.hoisted：mock 工厂先于 import 执行，必须同层提前建好）。 */
+const piAi = vi.hoisted(() => ({
+	available: true,
+	probes: 0,
+	defaultComplete: undefined as CompleteFn | undefined,
+}));
+
+vi.mock("../../src/runtime/llm-pi-ai.js", () => ({
+	isPiAiAvailable: () => {
+		piAi.probes += 1;
+		return piAi.available;
+	},
+	// 懒建 + 单例（与真模块同形）：同一份实例既用于绑定，也供用例做身份断言。
+	defaultPiAiComplete: () =>
+		(piAi.defaultComplete ??= async () => ({ text: '["pi-ai"]' })),
+}));
+
+/** llm 节点声明的产出 schema（数组——写往 State.log，真跑时与 state 形状一致）。 */
+const draftSchema = Type.Array(Type.String());
+
+/** 记录每次调用的 prompt、返回固定文本的 fake complete。 */
+function fakeComplete(text: string): { complete: CompleteFn; calls: string[] } {
+	const calls: string[] = [];
+	const complete: CompleteFn = async (req) => {
+		calls.push(req.prompt);
+		return { text };
+	};
+	return { complete, calls };
+}
+
+/** 单个 llm 节点（draft → log）的最小合法图；`complete` 缺省 = 交给 compile 解析。 */
+function llmGraph(complete?: CompleteFn): StateGraph<State> {
+	return new StateGraph<State>()
+		.addNode(
+			"draft",
+			llmNode<State, "log">({
+				prompt: "draft {count}",
+				schema: draftSchema,
+				writeTo: "log",
+				complete,
+			}),
+		)
+		.addEdge(START, "draft")
+		.addEdge("draft", END);
+}
+
+/** compile（可带选项）并交出图数据（既有 dataOf 只支持无参 compile）。 */
+function dataWithOptions(
+	graph: StateGraph<State>,
+	options?: CompileOptions,
+): CompiledGraphData<State> {
+	const compiled = graph.compile(options) as CompiledGraph<State> & {
+		readonly data: CompiledGraphData<State>;
+	};
+	return compiled.data;
+}
+
+/** 在"pi-ai 不可用"下跑一段同步断言（finally 复位：探测状态不跨用例泄漏）。 */
+function asUnavailable(fn: () => void): void {
+	piAi.available = false;
+	try {
+		fn();
+	} finally {
+		piAi.available = true;
+	}
+}
+
+describe("compile: llm completion resolution (§6.6/D12, Task 8)", () => {
+	it("reports an llm node with no completion implementation when pi-ai is unavailable", () => {
+		asUnavailable(() => {
+			const error = captureIssues(() => llmGraph().compile());
+
+			// 硬错误（GraphValidationError）而非运行期爆炸——issues 恰 1 条
+			expect(error.issues).toHaveLength(1);
+			expect(error.issues[0]).toContain(
+				'node "draft" (kind "llm") has no completion implementation',
+			);
+			// 消息可行动（T7 review）：三条出路都在
+			expect(error.issues[0]).toContain("services.complete");
+			expect(error.issues[0]).toContain("npm i @earendil-works/pi-ai");
+		});
+	});
+
+	it("accepts an llm node when services.complete is provided (pi-ai unavailable)", () => {
+		const { complete } = fakeComplete('["services"]');
+
+		asUnavailable(() => {
+			const data = dataWithOptions(llmGraph(), { services: { complete } });
+
+			// 解析结果落进图数据的定义副本（D12 的绑定口径）
+			expect(data.nodes.get("draft")?.complete).toBe(complete);
+		});
+	});
+
+	it("accepts an llm node when node-level complete is provided, without probing pi-ai", () => {
+		const { complete } = fakeComplete('["node"]');
+		piAi.probes = 0;
+
+		asUnavailable(() => {
+			const data = dataWithOptions(llmGraph(complete));
+
+			expect(data.nodes.get("draft")?.complete).toBe(complete);
+			// 探测闸门（D12）：每个 llm 节点都有显式 complete → 完全不问 pi-ai
+			expect(piAi.probes).toBe(0);
+		});
+	});
+
+	it("prefers node complete over services.complete (call log assertion)", async () => {
+		const node = fakeComplete('["node"]');
+		const services = fakeComplete('["services"]');
+		// 连 pi-ai 都没有：三级解析仍以最前的节点级为胜
+		piAi.available = false;
+		try {
+			const compiled = llmGraph(node.complete).compile({
+				services: { complete: services.complete },
+			});
+			const { state } = await compiled.run({ count: 2, log: [] });
+
+			// 真跑一遍：只有节点级 complete 被调用（prompt 插值 + writeTo 包装都走通）
+			expect(node.calls).toEqual(["draft 2"]);
+			expect(services.calls).toEqual([]);
+			expect(state.log).toEqual(["node"]);
+		} finally {
+			piAi.available = true;
+		}
+	});
+
+	it("reports a non-llm node that declares complete", () => {
+		const { complete } = fakeComplete("[]");
+
+		const error = captureIssues(() =>
+			minimal()
+				.addNode("worker", { kind: "fn", name: "", handler: noop, complete })
+				.compile(),
+		);
+
+		expect(error.issues).toHaveLength(1);
+		expect(error.issues[0]).toBe(
+			'node "worker" (kind "fn") must not declare complete: it is only supported on kind "llm" nodes',
+		);
+	});
+
+	it("collects completion issues alongside earlier checks in one GraphValidationError", () => {
+		const { complete } = fakeComplete("[]");
+
+		asUnavailable(() => {
+			const graph = llmGraph().addNode("worker", {
+				kind: "fn",
+				name: "",
+				handler: noop,
+				complete,
+			});
+
+			const error = captureIssues(() => graph.compile());
+
+			// 全量收集（§6）：新检查不 fail-fast，与既有检查同批报出
+			expect(error.message).toBe("graph invalid");
+			expect(error.issues).toHaveLength(2);
+			expect(
+				error.issues.some((issue) =>
+					issue.includes(
+						'node "draft" (kind "llm") has no completion implementation',
+					),
+				),
+			).toBe(true);
+			expect(
+				error.issues.some((issue) =>
+					issue.includes('node "worker" (kind "fn") must not declare complete'),
+				),
+			).toBe(true);
+		});
+	});
+
+	it("binds the pi-ai default when available and no complete is provided", async () => {
+		// 可用（mock 的默认值）：默认实现的注入点就是 mock 的 defaultPiAiComplete
+		const compiled = llmGraph().compile();
+
+		const bound = (
+			compiled as CompiledGraph<State> & {
+				readonly data: CompiledGraphData<State>;
+			}
+		).data.nodes.get("draft");
+		expect(bound?.complete).toBe(defaultPiAiComplete());
+
+		const events: RunEvent[] = [];
+		const { state } = await compiled.run(
+			{ count: 0, log: [] },
+			{ onEvent: (event) => events.push(event) },
+		);
+
+		// 默认实现（fake）真的被调用：解析值经引擎 writeTo 包装落进 state
+		expect(state.log).toEqual(["pi-ai"]);
+		const finished = events.filter((event) => event.type === "node_finished");
+		expect(finished).toHaveLength(1);
+		expect(finished[0]).toMatchObject({
+			node: "draft",
+			instanceId: "draft#1",
+			output: ["pi-ai"],
+		});
+	});
+});
