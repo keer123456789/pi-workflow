@@ -467,7 +467,7 @@ for step in 0..:
 
 ```jsonl
 {"ts":"...","seq":1,"type":"run_started","runId":"...","graph":"contract-review","superstep":0,"input":{...}}
-{"ts":"...","seq":3,"type":"node_started","runId":"...","superstep":2,"node":"review","instanceId":"review#7","kind":"llm","input":{...}}
+{"ts":"...","seq":3,"type":"node_started","runId":"...","superstep":2,"node":"review","instanceId":"review#7","kind":"llm"}
 {"ts":"...","seq":8,"superstep":2,"type":"node_retry","runId":"...","node":"review","instanceId":"review#7","attempt":1,"error":"429 rate limit"}
 {"ts":"...","seq":9,"type":"node_finished","runId":"...","superstep":2,"node":"review","instanceId":"review#7","output":{...},"usage":{"input":1000,"output":234,"cacheRead":0,"cacheWrite":0,"totalTokens":1234},"durationMs":4200}
 {"ts":"...","seq":12,"type":"superstep_committed","runId":"...","superstep":2}
@@ -477,9 +477,9 @@ for step in 0..:
 - **所有事件带 `seq` 与 `superstep`**；seq 从 1 起单调递增；**committed 语义 = 边界事件方案（D10）**：逐事件打标 `committed:false` 不可实现（事件实时按完成序发出，不缓冲不重排），某超步是否提交看它的事件之后跟随的边界事件——`superstep_committed`（已提交）/ `superstep_aborted`（未提交，含失败超步），消费方按最近边界判定；事件溯源重放（v2）只重放 committed 超步；
 - **文件布局（D9）**：每行一个 JSON 事件（与 `onEvent` 同序 = 完成序），行尾 `\n`、同步 append；文件至少含 `run_started` … `run_finished`；
 - `node_retry`（每次重试前一条）字段 = 样例的 `node` / `instanceId` / `attempt` / `error`；`attempt` 是**刚失败的那次尝试**编号（1 起），`error` 是失败错误的消息文本；只在"重试确实会发生"时发出（实例已取消就不发，R20a）；`node_finished.durationMs` 是**实例墙钟时长**，含重试与退避（不是最后一次尝试的耗时）；
-- `node_finished.usage?`（D11）：成功尝试经 `ctx.reportUsage` 上报的用量（按 attempt 取末次）；未上报时字段缺省，失败/重试的尝试不产生 usage；
+- `node_finished.usage?`（D11）：成功尝试经 `ctx.reportUsage` 上报的用量（按 attempt 取末次）；未上报时字段缺省，失败/重试的尝试不产生 usage——complete 已返回 usage 但输出未过 schema 校验的尝试同待遇，实际消耗按补全适配器侧计，不依赖 `node_finished.usage`；
 - 事件同时经 `onEvent` 实时发出：**顺序保证 = 完成序（实时性优先）**，字段 `seq` 供需要全序的消费者（重放、审计）重排；
-- **脱敏（`logOutputs: "hash"`，D7）**：`run_started.input`、`node_started.input`、`node_finished.output` 三字段替换为字符串 `"sha256:<64位hex>"`（`sha256(JSON.stringify(value))`；stringify 抛错时对 `"[unserializable]"` 取哈希）——**onEvent 与日志文件两路都拿脱敏后的事件**（避免全文经回调泄露，法律文书敏感）；
+- **脱敏（`logOutputs: "hash"`，D7）**：`run_started.input`、`node_finished.output` 两字段替换为字符串 `"sha256:<64位hex>"`（`sha256(JSON.stringify(value))`；stringify 抛错时对 `"[unserializable]"` 取哈希）——**onEvent 与日志文件两路都拿脱敏后的事件**（避免全文经回调泄露，法律文书敏感）；
 - **日志写失败（D8）**：默认 `onLogError: "fail"`——logger 任一钩子抛错使 run 以 `WorkflowError("run log write failed: <原因>")` 拒绝、`cause` 附原错，含收尾阶段（`run_finished` 已发后 `onRunFinish` 抛错同样拒绝；审计要求）；`"warn"` 的确切降级行为 = `console.warn("pi-workflow: run log write failed: <原因>")` 并继续；**预检失败**（初始 state 校验 / 已 abort 的 signal）的 run 不创建日志；full 模式下不可序列化 payload（循环引用 / BigInt 等）属日志写失败，按 onLogError 策略处置；hash 模式对其有 "[unserializable]" 哈希兜底（D7）。
 - 日志是 v2 断点续跑的数据基础（事件溯源 + seq 重放）。
 
@@ -530,8 +530,13 @@ core 只认识这两个接口。`executor: "subprocess" | "sdk"` 是语法糖，
 
 ### 9.4 llm 默认实现（M2）
 
-- `@earendil-works/pi-ai` 的补全 API（provider 无关），optional peerDependency；
-- 未注入 `complete` 且 pi-ai 不可用 → **compile 期报错**。
+- `@earendil-works/pi-ai`（optional peerDependency，`^1.0.4`）的补全 API（provider 无关）作为 llm 节点的默认 complete；
+- **可用性探测**：compile 期 `isPiAiAvailable()`（能解析包即 true，结果进程内缓存、永不抛）；未注入 `complete`、`services.complete` 且探测不可用 → **compile 期报错**（issue："has no completion implementation"）；
+- **懒加载单例**：`defaultPiAiComplete()` 取函数不加载，首次调用才动态 import（根 barrel 取 `contentText`、`providers/all` 取 `builtinModels()`）；探测与加载是两个动作，探测通过但加载失败属极端环境问题（失败被记住，错误信息可读并含 cause）；
+- **模型串** `"<provider>/<id>"` 按**第一个** `/` 切分（id 可再含 `/`）；缺 `/`、空段、未配置或 `getModel` 未命中 → 可读的作者错误（发请求前抛，不重试）；
+- **成败只认助手消息 `stopReason`**：成功白名单 `{stop, length, toolUse}`（`length` 的截断正文照常返回，schema 违规由 llm 节点按可重试失败处理）；`error` → 抛 `pi-ai completion failed: <errorMessage>`（原文保留，瞬态文本仍可被重试分类匹配）；`aborted` → 抛 `name = "AbortError"` 的错误（半截正文不算成功）；`deferred`/`pending` → 可读错误（llm 节点不支持异步补全）；未知值 → 失败不猜；
+- **usage 映射（D4 形状）**：只带五计数 + 可选 `cost`（源有才带）；pi-ai 独有的 `cacheWrite1h`/`reasoning`/`raw*` 不转发；
+- `timeoutMs` 不转发：引擎的单次尝试超时就是 abort signal（§7.3），适配器复用同一取消链。
 
 ### 9.5 依赖策略与发布形态
 
