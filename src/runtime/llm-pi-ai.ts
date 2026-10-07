@@ -18,10 +18,12 @@
  * 消息不落 D3 可重试族）。转发形状：
  * `completeSimple(model, { messages: [{ role: "user", content: prompt, timestamp }] }, { signal })`
  * ——`timeoutMs` 不转发：引擎的单次尝试超时就是 `abort` 这个 `signal`（§7.3/T11），
- * 适配器复用同一根取消链即可。`stopReason === "error"` → 抛
- * `pi-ai completion failed: <errorMessage>`（消息保留 provider 原文，瞬态文本仍能被
- * `isRetryableError` 的 D3 正则族匹配）；文本 `contentText(msg.content)`；usage 按 D4
- * 映射（`cost` 只在源 usage 带 cost 时进结果）。
+ * 适配器复用同一根取消链即可。**成败只认助手消息的 `stopReason`**（§9.2；R1 收紧）：成功 =
+ * 白名单 `{stop, length, toolUse}`；`error` → 抛 `pi-ai completion failed: <errorMessage>`
+ * （消息保留 provider 原文，瞬态文本仍能被 `isRetryableError` 的 D3 正则族匹配）；
+ * `aborted` → 抛 `name = "AbortError"` 的错误（半截正文不算成功）；`deferred`/`pending` →
+ * 可读错误（llm 节点不支持异步补全）；未知值 → 报"unsupported stopReason"。成功路径文本
+ * `contentText(msg.content)`；usage 按 D4 映射（`cost` 只在源 usage 带 cost 时进结果）。
  *
  * 不进 `src/index.ts` 公开面（Task 9 决定导出面）：本模块供 compile 期解析（Task 8）与
  * 高级用户直接接线用。
@@ -146,10 +148,30 @@ function createDefaultComplete(): CompleteFn {
 			{ signal: req.signal },
 		);
 
-		if (message.stopReason === "error") {
-			throw new Error(
-				`pi-ai completion failed: ${message.errorMessage ?? "(provider reported an error without a message)"}`,
-			);
+		// 成败只认助手消息的 stopReason（§9.2；R1 收紧）：成功 = 白名单
+		// {stop, length, toolUse}，其余逐类明确失败——**绝不把可能半截的文本当成功返回**。
+		// （length：截断的正文照常返回，JSON/schema 违规由 llm 节点按可重试失败处理。）
+		switch (message.stopReason) {
+			case "stop":
+			case "length":
+			case "toolUse":
+				break;
+			case "error":
+				throw new Error(
+					`pi-ai completion failed: ${message.errorMessage ?? "(provider reported an error without a message)"}`,
+				);
+			case "aborted":
+				throw abortError(message.errorMessage);
+			case "deferred":
+			case "pending":
+				throw new Error(
+					`pi-ai ${message.stopReason} completions are not supported by the llm node`,
+				);
+			default:
+				// 白名单之外（未来 pi-ai 新增的 stopReason）：失败要响，不猜。
+				throw new Error(
+					`pi-ai completion failed: unsupported stopReason "${String(message.stopReason)}"`,
+				);
 		}
 
 		return {
@@ -157,6 +179,21 @@ function createDefaultComplete(): CompleteFn {
 			usage: toTokenUsage(message.usage),
 		};
 	};
+}
+
+/**
+ * abort 失败（R1）：`name = "AbortError"` 的普通 Error——调用方/上层能按名字识别"这是取消"
+ * （DOMException 在本仓库不合用：Node 里它不是 `Error` 子类，引擎的 `messageOf` 会把
+ * `JSON.stringify` 出的 `{}` 当消息，诊断反而丢失）。消息不落 D3 可重试族（取消不该重试）。
+ */
+function abortError(detail: string | undefined): Error {
+	const error = new Error(
+		detail === undefined
+			? "pi-ai completion aborted"
+			: `pi-ai completion aborted: ${detail}`,
+	);
+	error.name = "AbortError";
+	return error;
 }
 
 /**

@@ -233,6 +233,57 @@ describe("defaultPiAiComplete", () => {
 		expect(isRetryableError(bare)).toBe(false); // 无瞬态线索 → 不重试（D3 保守）
 	});
 
+	it("rejects an aborted completion with an AbortError instead of returning partial text", async () => {
+		// R1（§9.2）：stopReason "aborted" 意味着正文可能半截——绝不当成功返回。
+		mocks.getModel.mockReturnValue({});
+		mocks.completeSimple.mockResolvedValue(
+			assistantMessage({
+				content: [{ type: "text", text: '{"answer":"par' }], // 半截 JSON
+				stopReason: "aborted",
+				errorMessage: "aborted by caller",
+			}),
+		);
+
+		const error = await rejectionOf(defaultPiAiComplete()(request()));
+
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).name).toBe("AbortError");
+		expect((error as Error).message).toContain("pi-ai completion aborted");
+		expect((error as Error).message).toContain("aborted by caller");
+		expect(mocks.contentText).not.toHaveBeenCalled(); // 半截正文没有被当成结果
+		expect(isRetryableError(error)).toBe(false); // 取消不属 D3 可重试族
+
+		// 没有 errorMessage 时消息同样可读。
+		mocks.completeSimple.mockResolvedValue(
+			assistantMessage({ content: [], stopReason: "aborted" }),
+		);
+		const bare = await rejectionOf(defaultPiAiComplete()(request()));
+		expect((bare as Error).name).toBe("AbortError");
+		expect((bare as Error).message).toBe("pi-ai completion aborted");
+	});
+
+	it("rejects deferred/pending completions with a readable error", async () => {
+		// R1：llm 节点是"一次性补全"，拿不到（也不该等）异步延续的正文。
+		mocks.getModel.mockReturnValue({});
+		mocks.completeSimple.mockResolvedValue(
+			assistantMessage({ content: [], stopReason: "deferred" }),
+		);
+
+		const deferred = await rejectionOf(defaultPiAiComplete()(request()));
+
+		expect(deferred).toBeInstanceOf(Error);
+		expect((deferred as Error).message).toContain("deferred");
+		expect((deferred as Error).message).toContain("not supported");
+		expect(mocks.contentText).not.toHaveBeenCalled();
+
+		mocks.completeSimple.mockResolvedValue(
+			assistantMessage({ content: [], stopReason: "pending" }),
+		);
+		const pending = await rejectionOf(defaultPiAiComplete()(request()));
+		expect((pending as Error).message).toContain("pending");
+		expect((pending as Error).message).toContain("not supported");
+	});
+
 	it("throws a readable error for a missing '/' or unknown model", async () => {
 		const complete = defaultPiAiComplete();
 
