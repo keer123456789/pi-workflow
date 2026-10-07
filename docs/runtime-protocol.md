@@ -288,7 +288,7 @@ session → agent_start → turn_start
 
 ### ④.4 最终文本的取用优先级（实测＋建议）
 
-1. `message_end` / `turn_end` 中 assistant `message.content[]` 的 `type:"text"` 拼接（实测即最终答案 `"好的"`）；
+1. 取**最后一条** assistant 消息的 `content[]` 中 `type:"text"` 项拼接（逐轮都有 `message_end`/`turn_end`，多轮或含工具调用时以 `agent_end.messages` 尾部的 assistant 消息为准；实测单轮即最终答案 `"好的"`）；
 2. `agent_end.messages` 的最后一条 assistant 消息（等价权威副本，实测一致）；
 3. `message_update` 的 `text_delta` 仅用于实时进度，**不要**当最终值来源。
 
@@ -346,7 +346,18 @@ SUCCESS: The process with PID 9496 (child process of PID 11132) has been termina
 EXIT=0
 ```
 
-杀后验证：`tasklist | grep -i node.exe` 为空；与运行前快照 **diff 无差异（无新孤儿进程）**；逐 PID 查询三个进程均 `No tasks are running`。宿主心跳自此停止（无任何收尾打印，符合 /F 硬杀）。
+杀后验证（命令与输出原文）：
+
+```
+$ tasklist | grep -i "node.exe" | sort > nodes-before.txt     # 运行前快照：0 行（文件 0 字节）
+$ tasklist | grep -i "node.exe" | sort > nodes-after.txt      # 杀后快照：0 行（文件 0 字节）
+$ diff nodes-before.txt nodes-after.txt && echo "(identical to BEFORE snapshot)"
+(identical to BEFORE snapshot)
+$ tasklist //FI "PID eq 8796"        # 三个 PID（8796/12368/9496）逐个查，均：
+INFO: No tasks are running which match the specified criteria.
+```
+
+宿主心跳在杀后停止（无任何收尾打印，符合 /F 硬杀）。
 
 ### ⑤.3 验证 2：按 spawn 句柄 PID 杀子进程树（M3 用例）+ stdin 开放阻塞交叉验证
 
@@ -358,7 +369,14 @@ SUCCESS: The process with PID 10920 (child process of PID 4416) has been termina
 SUCCESS: The process with PID 4416 (child process of PID 14544) has been terminated.
 ```
 
-宿主随即收到 `CHILD_EXIT code=1 signal=null`（被杀的子进程退出码为 1，`signal` 为 null——**Windows 下不要依赖 signal 判断被杀**）。杀后 `tasklist` 与运行前 diff 无差异。
+宿主随即收到 `CHILD_EXIT code=1 signal=null`（被杀的子进程退出码为 1，`signal` 为 null——**Windows 下不要依赖 signal 判断被杀**）。杀后清点（命令与输出原文）：
+
+```
+$ diff nodes-before2.txt nodes-after2.txt && echo "(no new leftovers vs before)"
+(no new leftovers vs before)
+```
+
+（两快照均 0 行 / 0 字节。）
 
 ### ⑤.4 冻结要点
 
@@ -369,18 +387,24 @@ SUCCESS: The process with PID 4416 (child process of PID 14544) has been termina
 
 ## ⑥ 与 design.md §9.2 的差异修正列表
 
-下表列出本次冻结相对 design.md 原文（HEAD 版本）的全部修正；已按此更新 §9.2（本次提交含 design.md）。
+### ⑥.1 本次冻结对 design.md §9.2 的全部改动（与 §9.2 相对原始设计的累计 diff 逐条对应；本次修复轮 R1 的两处措辞修正计入第 4 行）
 
-| # | design.md §9.2 原文 | 实测修正 |
-|---|---|---|
-| 1 | "task 文本优先走 **stdin**（…stdin 不可行则落临时文件）" | **stdin 可行（实测）**：40k 字符经 stdin 完整送达，**临时文件兜底未触发**（作为条件分支保留，实现时可不建该路径）；但**必须关闭 stdin**（`ignore` 或写完 `end()`）——保持打开会无限期阻塞（≥40s 无任何输出，历史观测 ≥6min）。同时禁止 stdin+argv 同给（实测拼接为 `"AAABBB"`，stdin 在前） |
-| 2 | "解析 stdout 逐行 JSON 事件流：累计最终 assistant 文本与 usage" | 补充：**首行为 session header（`type:"session"`，`--no-session` 也输出）必须跳过**；最终文本取 `message_end`/`turn_end` 的 assistant `content[]` 中 `type:"text"`（`agent_end.messages` 为权威副本）；usage 在 assistant 消息对象内（`input/output/cacheRead/cacheWrite/totalTokens/cost`，键集可变，如 `cacheWrite1h` 可有可无） |
-| 3 | 未提退出码语义 | 补充：**LLM 失败时退出码仍为 0**（实测 403 → EXIT=0），成败必须由事件流 `stopReason`（`"error"`/`"aborted"`）与 `errorMessage` 判定；**但启动期错误（模型不存在/无凭据）退出码 1、stdout 无事件流、错误在 stderr**——退出码 0 与事件流判定两者都要做 |
-| 4 | "杀进程用 `taskkill /T /F`" | 精确化为 `taskkill /PID <spawn返回的pid> /T /F`；**/T 不可省**（shell:true 下句柄 PID 是 cmd.exe，pi 是孙进程）；git-bash 内直接写 `/PID` 会被 MSYS 改写而失败，需 `cmd //c`（Node 内 execFile 直传参数无此问题） |
-| 5 | "调用时执行 `pi --version` 探测，仅支持已验证的版本区间" | 已实测：输出为**单行裸 semver**（`1.0.4`，LF 结尾，stderr 空，EXIT=0）→ 解析 `/^\d+\.\d+\.\d+$/` 即可 |
-| 6 | "认证沿用 `~/.pi` 已登录凭据"（原文未涉环境差异） | 补充：`ANTHROPIC_BASE_URL`/`ANTHROPIC_MODEL` **不被读取**（不可路由 baseUrl 的 marker 实测证明）；`ANTHROPIC_AUTH_TOKEN` **会被读取**（去掉后报 `No API key found for the selected model.`，EXIT=1）；企业网关用 `PI_CODING_AGENT_DIR` + `models.json` 自定义 provider（实测成功，"$ENV 插值"有效） |
-| 7 | 未提 `-p` / `--tools` 细节 | 补充：`--mode json` 下 `-p` 可省（实测行为一致）；`--tools a,b,c` 为逗号分隔白名单（实测 `toolsAdded` 精确过滤）；`--model` 格式为 `<providerId>/<modelId>`，未知模型 → EXIT=1 + stderr |
-| 8 | 未提 `shell:true` 的代价 | 补充：Node ≥ 22 下 `shell:true` 触发 `[DEP0190]` 弃用告警（噪声，不阻断）；spawn 实测进程链 host node → cmd.exe → pi node |
+| # | design.md 位置 | 改动 | 实测依据 |
+|---|---|---|---|
+| 1 | :499（新增） | 加指针 blockquote："协议细节以《docs/runtime-protocol.md》为准"（冻结关系声明，非实测修正） | — |
+| 2 | :501 | stdin 补充：stdin 读到 EOF 为止、spawn **必须关闭 stdin**（否则无限期阻塞）；stdin 与 argv 同时给会无分隔符拼接、适配器二者只取其一 | ③.4 / ③.5 |
+| 3 | :503 | 事件流解析补充：**首行 session header（`--no-session` 也输出）需跳过**；最终文本取 `message_end`/`turn_end` 的 assistant `content[].text`（`agent_end.messages` 为权威副本）；usage 在 assistant 消息对象内 | ④.1–④.3 |
+| 4 | :503 | 退出码补充：**LLM 失败退出码仍为 0**，成败须看 `stopReason`（`"error"`/`"aborted"`，后者未实测）与 `errorMessage`；启动期错误（模型不存在/无凭据）退出码 1、错误只在 stderr、stdout 无事件流（无凭据场景仍有 182B 的 session header 行）——两套判定都要做 | ④.6 |
+| 5 | :503 | 版本探测补充：`pi --version` 输出单行裸 semver，按版本区间校验 | ① |
+| 6 | :505 | Windows spawn 补充：npm shim 为 `%APPDATA%/npm/{pi,pi.cmd,pi.ps1}`；杀进程 = `taskkill /PID <spawn 返回的 pid> /T /F`（`/T` 不可省：shell:true 下句柄 PID 是 cmd.exe，pi 本体是其孙进程） | ② / ⑤ |
+| 7 | :506 | 认证环境差异修正：`ANTHROPIC_BASE_URL`/`ANTHROPIC_MODEL` 不被读取（不可路由 baseUrl 的 marker 实测）；`ANTHROPIC_AUTH_TOKEN` 会被读取（去掉后 `No API key found for the selected model.`，EXIT=1）；企业网关用 `PI_CODING_AGENT_DIR` + `models.json` 自定义 provider | ③.7 / ② |
+
+### ⑥.2 实测补充但**未改动** design.md（仅记录于本文档）
+
+- `--mode json` 下 `-p` 可省（实测行为一致）；`--tools a,b,c` 为逗号分隔白名单（实测 `toolsAdded` 由 `["read","bash","edit","write"]` 精确过滤为 `["read"]`）；`--model` 格式为 `<providerId>/<modelId>`，未知模型 → EXIT=1 + stderr——记录于 ②。
+- Node ≥ 22 下 `shell:true` 触发 `[DEP0190]` 弃用告警（噪声，不阻断）；spawn 实测进程链 host node → cmd.exe → pi node——记录于 ②/⑤。
+- JSON-only 指令可行性（模型返回无栅栏纯净 JSON）——记录于 ④.5；§9.2 的 schema 条目未改动。
+- 终止细节：git-bash 直写 `/PID` 被 MSYS 改写需 `cmd //c`、taskkill `/T` 自叶向根、被杀子进程 `code=1 signal=null`、事件流任意点截断——记录于 ⑤。
 
 其他章节未改动；`--no-session` 不落盘、cwd 无新文件（实测）与 §9.2 原文一致，无修正。
 
@@ -391,7 +415,7 @@ SUCCESS: The process with PID 4416 (child process of PID 14544) has been termina
 - `--version`：main.ts 直接 `console.log(VERSION)` 后退出（实测单行裸版本号吻合）。
 - JSON 模式：`modes/print-mode.ts` 逐行 `JSON.stringify(toJsonEvent(event))`；启动时写 session header 行。
 - stdin：`readPipedStdin()` 仅在 stdin 非 TTY 时读取，EOF（`end` 事件）返回；`buildInitialMessage` 把 argv 与 stdin 内容 `parts.join("")` 拼接（与实测 `"AAABBB"` 相符）。
-- 退出码映射只在 text 模式做（`stopReason` error/aborted → exit 1）；json 模式恒 0——解释了"LLM 失败退出码 0"。
+- 退出码映射只在 text 模式做（`stopReason` error/aborted → exit 1）；**json 模式下 `stopReason` 不映射退出码**（LLM 失败仍 0）——解释了"LLM 失败退出码 0"；启动期错误不在此列（见 ④.6）。
 - stdout 保护（`core/output-guard.ts`）：json/rpc 模式接管 `process.stdout.write`，杂散输出改道 stderr，stdout 只含协议行。
 - 事件全集（`packages/agent` 类型定义）大于本 spike 所见：`tool_execution_*`、`auto_retry_start`、`compaction_*`、`queue_update` 等（解析器需容忍未知 type）。
 - `--no-session` → `SessionManager.inMemory()`（header 仍生成、不落盘，与实测吻合）。
