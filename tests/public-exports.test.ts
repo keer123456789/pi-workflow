@@ -28,6 +28,7 @@ import type {
 	RunEvent,
 	RunHandle,
 	RunOptions,
+	RunResult,
 	Services,
 	SleepResult,
 	StateSchema,
@@ -147,7 +148,8 @@ describe("public surface: src/index.ts (设计 §10)", () => {
 			warnings: [],
 		};
 
-		const result = await handle;
+		const runResult: RunResult<PublicState> = await handle;
+		const result = runResult;
 
 		expect(result.state.seen).toHaveLength(2);
 		expect(typeof result.runId).toBe("string");

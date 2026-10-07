@@ -7,15 +7,20 @@
  * - 每个 state key 随机挑 reducer：overwrite / append / concat / setOnce，或
  *   不声明（reducer-less：同超步多写 → InvalidWriteError）；
  * - handler 的写入 key 与值类型各自随机（多数相容、少数故意错配），另有
- *   输入派生值（inc / join）与 0–2 个微任务跳（扰动完成序，无真实计时器）。
+ *   输入派生值（inc / join）与 0–2 个微任务跳（扰动完成序，无真实计时器）；
+ * - **两个分层**（每 3 个迭代换一次，见 FORWARD_EVERY）：`mixed` 全随机（覆盖
+ *   "图会合法地失败"），`forward` 的目标只在更靠后的节点里挑（激活链索引严格递增
+ *   → 必然终止）——后者专门供给"完成 + 两次 run 全轨迹逐位一致"的高价值样本。
  *
  * 断言（每个种子跑两次，两次都是从同一 spec 独立装配 + 独立 compile）：
  * 1. **没有非预期错误类型**：任何失败都必须是 `WorkflowError` 家族（RouterError /
  *    InstanceBudgetError / GraphRecursionError / InvalidWriteError / NodeExecutionError
  *    都是合法结局），非 WorkflowError 的平台错误 = 失败；
- * 2. 两次 run 的**结局一致**（同为完成或同为失败——完成/失败混杂本身就是不确定性）；
+ * 2. 两次 run 的**结局一致**（同为完成、同为失败、同为跳过——混杂本身就是不确定性；
+ *    一次跳过另一次照跑同样不许）；
  * 3. 完成的图：两次 run 的最终 state 与整条轨迹（handler 调用、router 求值、
  *    reducer 折叠，均带 `structuredClone` 后的输入/输出）deep-equal 逐位一致；
+ *    失败的图：两次失败的**错误类名 + 消息逐字一致**；
  * 4. 构造期非法的图（GraphValidationError / GraphSealedError）跳过。
  *
  * 轨迹采集在测试内（闭包 recorder），不是引擎设施：handler 记录 `{seq, superstep,
@@ -163,6 +168,19 @@ const ROUTER_MODES = [
 ] as const;
 type RouterMode = (typeof ROUTER_MODES)[number];
 
+/** 会真的扇出实例（Send）的模式——统计"完成图里有多少带 Send 扇出"。 */
+const SEND_MODES: readonly RouterMode[] = ["sendConst", "sendList", "mixed"];
+
+/**
+ * 生成分层（R1，评审：随机图默认太容易撞环）。两个分层各司其职：
+ * - `mixed`：全随机（含回边/自环/任意 router 目标）——覆盖"图会合法地失败"的一面；
+ * - `forward`：目标只在**更靠后的节点**里挑（边与 router 都是），沿任何激活链索引严格
+ *   递增 → 必然终止（最后一个节点的 router 只可能返回 null/END）。这个分层专门供给
+ *   "完成 + 两次 run 全轨迹逐位一致"的高价值样本，同时保留随机 reducer 组合与
+ *   错配写入（InvalidWriteError 仍然会发生）。
+ */
+type Strat = "mixed" | "forward";
+
 type RouterSpec = {
 	mode: RouterMode;
 	/** 字符串目标（6% 概率掺入未注册名 → 运行期 RouterError，合法结局）。 */
@@ -202,33 +220,30 @@ function generateWrites(
 	return rules;
 }
 
+/** router 目标池 = `pool`（mixed 分层是整个图；forward 分层是"更靠后的节点"）。 */
 function generateRouter(
 	rng: Rng,
-	names: readonly string[],
+	pool: readonly string[],
 	from: string,
 ): RouterSpec {
 	const mode = pick(rng, ROUTER_MODES);
 	const targetCount = 1 + Math.floor(rng() * 3);
 	const targets = Array.from({ length: targetCount }, () =>
-		rng() < 0.06 ? "ghost" : pick(rng, names),
+		rng() < 0.06 ? "ghost" : pick(rng, pool),
 	);
-	// Send 目标 70% 避开自己（sendConst 打自己 = 每轮自我复制直到预算/递归兜底）
-	const others = names.filter((name) => name !== from);
+	// Send 目标 70% 避开自己（打到自己的 sendConst = 每轮自我复制直到预算/递归兜底）
+	const others = pool.filter((name) => name !== from);
+	const sendPool = others.length > 0 && rng() < 0.7 ? others : pool;
 	return {
 		mode,
 		targets,
-		sendTarget:
-			rng() < 0.06
-				? "ghost"
-				: rng() < 0.7
-					? pick(rng, others)
-					: pick(rng, names),
+		sendTarget: rng() < 0.06 ? "ghost" : pick(rng, sendPool),
 		sendCount: 1 + Math.floor(rng() * 3),
 		constant: Math.floor(rng() * 100),
 	};
 }
 
-function generateSpec(rng: Rng, injectInvalid: boolean): Spec {
+function generateSpec(rng: Rng, injectInvalid: boolean, strat: Strat): Spec {
 	const nodeCount = 3 + Math.floor(rng() * 6); // 3..8
 	const names = NODE_NAMES.slice(0, nodeCount);
 
@@ -257,10 +272,10 @@ function generateSpec(rng: Rng, injectInvalid: boolean): Spec {
 		spin: Math.floor(rng() * 3), // 0..2 个微任务跳
 	}));
 
-	// 普通边：START → 随机节点（保证图非空、至少跑一个超步）；每个节点 0..2 条出边，
-	// 目标 85% 向前（链式推进 → 深度）、7.5% 任意（回边 → 环）、7.5% 自环。
-	// 回边/自环刻意是少数派：环内没有收敛机制的图必然撞 recursionLimit（§5.5），
-	// 全随机图里那会淹没"完成图"的样本（`test: 反空洞` 的统计下限专门盯着这一点）。
+	// 普通边：START → 随机节点（保证图非空、至少跑一个超步）；每个节点 0..2 条出边。
+	// mixed 分层：目标 85% 向前、7.5% 任意（回边）、7.5% 自环——环内没有收敛机制的图
+	// 必然撞 recursionLimit（§5.5），这是合法结局，但刻意是少数派。
+	// forward 分层：只连更靠后的节点（链到尾）——终止性由分层保证。
 	const plainEdges: [string, string][] = [[START, pick(rng, names)]];
 	const seenEdges = new Set<string>([`${START}->${plainEdges[0][1]}`]);
 	const addEdgeSpec = (from: string, to: string): void => {
@@ -277,6 +292,12 @@ function generateSpec(rng: Rng, injectInvalid: boolean): Spec {
 		const edgeCount = Math.floor(rng() * 3); // 0..2
 		for (let i = 0; i < edgeCount; i += 1) {
 			const roll = rng();
+			if (strat === "forward") {
+				if (forward.length > 0) {
+					addEdgeSpec(name, pick(rng, forward));
+				}
+				continue;
+			}
 			addEdgeSpec(
 				name,
 				forward.length > 0 && roll < 0.85
@@ -289,9 +310,33 @@ function generateSpec(rng: Rng, injectInvalid: boolean): Spec {
 	}
 
 	const routers: { from: string; router: RouterSpec }[] = [];
-	for (const name of names) {
+	for (const [index, name] of names.entries()) {
+		const forward = names.slice(index + 1);
+		if (strat === "forward" && forward.length === 0) {
+			// 最后一个节点：router 只可能终止（否则它与自己的入边就能成环）
+			if (rng() < 0.5) {
+				routers.push({
+					from: name,
+					router: {
+						mode: "null",
+						targets: [],
+						sendTarget: name,
+						sendCount: 1,
+						constant: Math.floor(rng() * 100),
+					},
+				});
+			}
+			continue;
+		}
 		if (rng() < 0.5) {
-			routers.push({ from: name, router: generateRouter(rng, names, name) });
+			routers.push({
+				from: name,
+				router: generateRouter(
+					rng,
+					strat === "forward" ? forward : names,
+					name,
+				),
+			});
 		}
 	}
 
@@ -599,13 +644,26 @@ const ITERATIONS = 30;
 const SEED_BASE = 20_261_007;
 /** 每 7 个迭代生成一张 compile 期非法的图（`iteration % 7 === 3`）→ SKIP 路径有活体覆盖。 */
 const INVALID_EVERY = 7;
+/** 每 3 个迭代换用 `forward` 分层（~1/3 的种子专门供给"完成图"的全轨迹比较，R1）。 */
+const FORWARD_EVERY = 3;
+
+/** 失败的可比较指纹：类名 + 消息（两次 run 的失败必须逐字一致）。 */
+function failureFingerprint(error: unknown): string {
+	if (error instanceof Error) {
+		return `${error.constructor.name}: ${error.message}`;
+	}
+	return `non-error: ${String(error)}`;
+}
 
 describe("property: seeded random graphs are deterministic (设计 §12)", () => {
 	it("random graphs are deterministic (seeded, 30 iterations)", async () => {
 		const stats = {
 			/** 两次 run 都完成 → 做了 state + 全轨迹的逐位比较。 */
 			completed: 0,
-			/** 两次 run 都以（合法的）WorkflowError 失败 → 只比较结局。 */
+			/** 完成图里带 router / 带 Send 扇出的数量（保证高价值样本不是"光杆链"）。 */
+			completedWithRouter: 0,
+			completedWithSendFanout: 0,
+			/** 两次 run 都以（合法的）WorkflowError 失败 → 比较错误类 + 消息。 */
 			failed: 0,
 			/** 构造期非法的图 → 跳过（不算失败）。 */
 			skipped: 0,
@@ -619,17 +677,19 @@ describe("property: seeded random graphs are deterministic (设计 §12)", () =>
 			const spec = generateSpec(
 				mulberry32(seed),
 				iteration % INVALID_EVERY === 3,
+				iteration % FORWARD_EVERY === 2 ? "forward" : "mixed",
 			);
 			const label = `seed ${seed} (iteration ${iteration}): ${describeSpec(spec)}`;
 
-			if (spec.routers.length > 0) {
+			const hasRouter = spec.routers.length > 0;
+			const hasSendFanout = spec.routers.some(({ router }) =>
+				SEND_MODES.includes(router.mode),
+			);
+
+			if (hasRouter) {
 				stats.withRouters += 1;
 			}
-			if (
-				spec.routers.some(({ router }) =>
-					["sendConst", "sendList", "mixed"].includes(router.mode),
-				)
-			) {
+			if (hasSendFanout) {
 				stats.withSendFanout += 1;
 			}
 
@@ -637,7 +697,9 @@ describe("property: seeded random graphs are deterministic (设计 §12)", () =>
 			const first = await attempt(spec);
 			const second = await attempt(spec);
 
-			if (first.status === "skipped" || second.status === "skipped") {
+			// (0) 结局一致（含 SKIP）：同一 spec 两次装配不允许一次跳过、另一次照跑
+			expect(second.status, `${label} [outcome]`).toBe(first.status);
+			if (first.status === "skipped" && second.status === "skipped") {
 				stats.skipped += 1;
 				continue;
 			}
@@ -650,11 +712,14 @@ describe("property: seeded random graphs are deterministic (设计 §12)", () =>
 				expect(second.error, `${label} [run B]`).toBeInstanceOf(WorkflowError);
 			}
 
-			// (2) 结局一致：完成/失败混杂本身就是不确定性
-			expect(second.status, `${label} [outcome]`).toBe(first.status);
-
 			if (first.status === "completed" && second.status === "completed") {
 				stats.completed += 1;
+				if (hasRouter) {
+					stats.completedWithRouter += 1;
+				}
+				if (hasSendFanout) {
+					stats.completedWithSendFanout += 1;
+				}
 				const supersteps = first.recorder.handlerCalls.map(
 					(call) => call.superstep,
 				);
@@ -667,21 +732,32 @@ describe("property: seeded random graphs are deterministic (设计 §12)", () =>
 					`${label} [recorder]`,
 				).toBeGreaterThan(0);
 
-				// (3) 最终 state 与整条轨迹逐位一致
+				// (2) 最终 state 与整条轨迹逐位一致
 				expect(second.state, `${label} [state]`).toEqual(first.state);
 				expect(second.recorder, `${label} [trace]`).toEqual(first.recorder);
-			} else {
+			} else if (first.status === "failed" && second.status === "failed") {
 				stats.failed += 1;
+				// (3) 失败也要一模一样：合法错误类 + 消息逐字一致
+				expect(failureFingerprint(second.error), `${label} [error]`).toBe(
+					failureFingerprint(first.error),
+				);
+			} else {
+				// 上一条 outcome 断言已经排除了这个分支；留在这里只为类型穷尽
+				throw new Error(
+					`${label}: mixed outcomes (${first.status} vs ${second.status})`,
+				);
 			}
 		}
 
-		// 反空洞下限：生成器确实产出了各种形状，且"完成 + 两次逐位一致"的样本足够多。
+		// 反空洞下限（数值取实测产出并留余量；不得为了"好看"往下调）。
 		// 随机图的失败是设计的一部分（环撞 recursionLimit、错配/冲突抛 InvalidWriteError、
-		// 非法路由抛 RouterError——都是合法的 WorkflowError 结局），所以下限是"够用"
-		// 而非"几乎全绿"：低于它说明生成器退化成只有失败图，属性测试就不再证明什么。
+		// 非法路由抛 RouterError——都是合法的 WorkflowError 结局），所以下限盯的是
+		// "高价值样本（完成 + 两次全轨迹一致）足够多"，低于它说明生成器退化成只有失败图。
 		expect(stats.completed + stats.failed + stats.skipped).toBe(ITERATIONS);
-		expect(stats.completed).toBeGreaterThanOrEqual(5);
-		expect(stats.multiSuperstep).toBeGreaterThanOrEqual(1);
+		expect(stats.completed).toBeGreaterThanOrEqual(7);
+		expect(stats.completedWithRouter).toBeGreaterThanOrEqual(5);
+		expect(stats.completedWithSendFanout).toBeGreaterThanOrEqual(2);
+		expect(stats.multiSuperstep).toBeGreaterThanOrEqual(3);
 		expect(stats.withRouters).toBeGreaterThanOrEqual(15);
 		expect(stats.withSendFanout).toBeGreaterThanOrEqual(5);
 		// SKIP 路径有活体覆盖（注入的非法图确实被跳过，而不是算成失败）

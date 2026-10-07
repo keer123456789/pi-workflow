@@ -9,8 +9,10 @@
  *
  * 内部设施**不进包面**：engine 的 executeRun/resolveServices、emitter、foldUpdates/
  * stateKeyUniverse、InstanceCancelledError 等都是实现细节（可自由重构，不构成契约）。
- * tests/public-exports.test.ts 用 `Object.keys` 的精确集合 + 类型位置的引用把这份口径
- * 钉住（多一个或少一个都会红）。
+ * tests/public-exports.test.ts 的钉法（覆盖范围如实说明）：
+ * - **运行期值**：`Object.keys` 精确集合——多导（内部泄漏）或少导都会红；
+ * - **类型**：只对上面列名的类型逐一在类型位置引用（删一个名字/改名 → typecheck 失败）；
+ *   **多导一个类型名在类型层面钉不住**（类型没有运行期痕迹）——这份清单本身就是口径。
  */
 
 // —— 错误分类（设计 §7；9 类全公开，调用方按类型分支） ——
