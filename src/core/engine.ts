@@ -790,6 +790,12 @@ async function executeInstance<S extends object>(args: {
 	const definition = graph.nodes.get(instance.node);
 	if (definition === undefined) {
 		// compile 校验保证激活目标都已注册（§6.1）；这里只防御手搓的图数据（不崩）。
+		// R20a 守卫（与形状判定 / 尝试失败两条兄弟路径同款）：实例信号已取消时，本分支的
+		// 失败也归"被取消"（进 collateral、不参与根因选举）——被 fail-fast 连带取消的实例
+		// 若能在这里以更小的实例序被选成根因，就会掩盖真正触发取消的那个失败。
+		if (instanceSignal.aborted) {
+			throw new InstanceCancelledError(instance.instanceId);
+		}
 		abortSiblings();
 		throw new NodeExecutionError(
 			`node "${instance.node}" (${instance.instanceId}) is not registered`,

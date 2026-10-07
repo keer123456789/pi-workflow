@@ -144,6 +144,8 @@ describe("instance budget guards: maxInstancesPerSuperstep (设计 §5.1:325, §
 		).toEqual([1]);
 		expect(ofType(events, "superstep_aborted")).toHaveLength(0);
 		expect(ofType(events, "node_failed")).toHaveLength(0);
+		// 单条 run_finished 契约：一次 run 恰好一条收尾事件
+		expect(ofType(events, "run_finished")).toHaveLength(1);
 		// run_finished.superstep = 该批将被执行的超步号（attempted superstep，与
 		// recursionLimit 的编号规则一致）：extract 跑的是 1，越限的是 2
 		expect(ofType(events, "run_finished")[0]).toMatchObject({
@@ -256,6 +258,8 @@ describe("instance budget guards: maxTotalInstances (设计 §5.1:326, §5.3)", 
 			ofType(events, "superstep_committed").map((e) => e.superstep),
 		).toEqual([1, 2, 3]);
 		expect(ofType(events, "superstep_aborted")).toHaveLength(0);
+		// 单条 run_finished 契约：一次 run 恰好一条收尾事件
+		expect(ofType(events, "run_finished")).toHaveLength(1);
 		// 失败记的是被拒绝的那一批的（尝试）超步号：3 个超步已跑完，第 4 个没跑成
 		expect(ofType(events, "run_finished")[0]).toMatchObject({
 			status: "failed",
@@ -528,6 +532,8 @@ describe("I/O concurrency cap: maxConcurrency (设计 §4.4 / §5.1:327)", () =>
 		expect(ofType(events, "superstep_aborted").map((e) => e.superstep)).toEqual(
 			[2],
 		);
+		// 单条 run_finished 契约：取消路径同样恰好一条收尾事件
+		expect(ofType(events, "run_finished")).toHaveLength(1);
 		expect(ofType(events, "run_finished")[0]).toMatchObject({
 			status: "failed",
 			superstep: 2,

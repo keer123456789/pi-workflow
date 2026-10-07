@@ -146,10 +146,15 @@ export type ResolvedServices = {
  * 不落字段）。某超步是否提交看它的事件之后跟随的边界事件——`superstep_committed`
  * 已提交 / `superstep_aborted` 未提交（含失败超步）；消费方按最近边界判定。
  *
- * `run_finished.superstep` 语义（R1，与 `GraphRecursionError.superstep` 对齐）：
- * 实例失败 / 提交失败 / 生成下一批失败 = **已执行**的超步编号；recursionLimit 越限
- * （本超步未执行）= **尝试**的超步编号（limit + 1）；run 未开始（初始激活的内部
- * 不变量错误）= 0。
+ * `run_finished.superstep` 语义（R1）——**两套编号**，按结局分：
+ * - **失败路径**：实例失败 / 提交失败 / 生成下一批失败 = **已执行（或正在执行）**的超步
+ *   编号；**被拒绝、一个实例都没跑的那一批**（recursionLimit 越限、两类实例预算越限）=
+ *   **尝试**的超步编号（本超步未执行；limit 内跑满后 = limit + 1，与
+ *   `GraphRecursionError.superstep` 对齐）；run 未开始（初始激活的内部不变量错误）= 0。
+ * - **取消路径**（调用方 signal / `RunHandle.cancel()` / `runTimeoutMs` 到期）=
+ *   **最后执行过的**超步编号：超步之间取消 = 最近跑完的超步号；超步内取消 = 正在执行的
+ *   超步号（该超步整体不提交，随附 `superstep_aborted` 边界）。取消路径永远不会报一个
+ *   未执行的"尝试超步"。
  */
 export type RunEvent =
 	| {
@@ -234,6 +239,10 @@ export type RunEvent =
 /**
  * run 期执行控制（设计 §4.4；默认值：recursionLimit 25、maxConcurrency 8、
  * maxInstancesPerSuperstep 1000、maxTotalInstances 10000）。
+ *
+ * 数值上限的**非有限值**（NaN / +Infinity / -Infinity）一律回落各自默认值——Infinity
+ * **不代表"不限"**（落地界限形同虚设，与 recursionLimit 同一策略，见 engine.ts 的
+ * 归一函数）；`runTimeoutMs` 是例外：非有限或 <= 0 表示"无超时"（本就默认无超时）。
  */
 export type RunOptions = {
 	recursionLimit?: number;

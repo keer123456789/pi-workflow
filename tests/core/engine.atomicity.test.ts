@@ -832,6 +832,101 @@ describe("internal invariants: unregistered plain-edge targets (T8 review)", () 
 		expect(ofType(events, "run_finished")[0].status).toBe("failed");
 	});
 
+	it("an instance whose node vanished before execution: loud NodeExecutionError, cancelled sibling is collateral (R20a)", async () => {
+		// 走到 executeInstance 的"未注册节点"防御分支（engine.ts：`definition === undefined`）
+		// 的唯一现实途径：**激活之后、执行之前** caller 把节点从图数据里删掉。激活期的三条
+		// 路径（普通边 plainSuccessors / router 字符串 assertRoutableString / Send
+		// assertSendTarget）都先校验注册，所以未注册实例必须由"激活后的突变"造出来——
+		// 手搓图数据 + 一个在 router 里改图数据的调用方（图数据是调用方对象，§6 的封印
+		// 只管构建器，不管这份 map）。
+		//
+		// 断言两件事：
+		// 1. 该分支仍按"内部不变量被破坏"处理：NodeExecutionError 指认实例、fail-fast
+		//    取消兄弟实例（不静默跳过——跳过一个实例就等于静默改语义）；
+		// 2. 被它连带取消的兄弟进 collateral，不与它争根因——取消类失败不参与根因选举
+		//    （R20a；分支里新加的 `if (instanceSignal.aborted)` 守卫与该语义同款。该守卫
+		//    是**防御性**的：入口守卫用等价条件挡掉"开跑前已取消"的实例，本用例达到的是
+		//    分支本身，守卫行在今天的引擎里不可达——保留它是为了让该分支的判定与它的
+		//    两条兄弟路径保持同形，日后插进 await 也不会静默退化）。
+		const events: RunEvent[] = [];
+		const started: string[] = [];
+		const data: CompiledGraphData<BasicState> = {
+			name: "hand-built",
+			channels: {},
+			nodes: new Map([
+				["seed", fnNode<BasicState>(() => ({ x: 1 }))],
+				[
+					"slow",
+					fnNode<BasicState>(async (_input, ctx) => {
+						started.push(ctx.instanceId);
+						return await new Promise<Partial<BasicState>>(
+							(_resolve, reject) => {
+								// 被取消时以**普通 Error** 收场（不是 AbortError）：
+								// 取消判定与错误形状无关（R20a）
+								ctx.signal.addEventListener(
+									"abort",
+									() => reject(new Error("stopped")),
+									{ once: true },
+								);
+							},
+						);
+					}),
+				],
+				["victim", fnNode<BasicState>(() => ({}))],
+			]),
+			plainEdges: new Map([
+				[START, ["seed"]],
+				["seed", ["slow", "victim"]],
+			]),
+			// seed 的 router 在"激活之后"删掉 victim（两者都已被普通边激活）
+			routers: new Map([
+				[
+					"seed",
+					() => {
+						data.nodes.delete("victim");
+						return null;
+					},
+				],
+			]),
+			warnings: [],
+		};
+
+		const error = await captureRejection(
+			executeRun(
+				data,
+				{},
+				{ onEvent: (e) => events.push(e) },
+				resolveServices(),
+			),
+		);
+
+		expect(error).toBeInstanceOf(NodeExecutionError);
+		const nodeError = error as NodeExecutionError;
+		// 根因 = 节点已消失的那个实例（实例序 3），不是被它连带取消的 slow#2
+		expect(nodeError.instanceId).toBe("victim#3");
+		expect((error as Error).message).toContain("victim");
+		expect(nodeError.collateral).toEqual(["slow#2"]);
+		// slow#2 确实起跑过（node_started），被取消 → 不发 node_failed
+		expect(started).toEqual(["slow#2"]);
+		expect(ofType(events, "node_started").map((e) => e.instanceId)).toEqual([
+			"seed#1",
+			"slow#2",
+		]);
+		// 该分支不发光 node_failed（它是"内部不变量被破坏"，不是节点执行失败；事件边界
+		// 由 superstep_aborted 承担），错误本体仍是 NodeExecutionError
+		expect(ofType(events, "node_failed")).toHaveLength(0);
+		expect(
+			ofType(events, "superstep_committed").map((e) => e.superstep),
+		).toEqual([1]);
+		expect(ofType(events, "superstep_aborted").map((e) => e.superstep)).toEqual(
+			[2],
+		);
+		expect(ofType(events, "run_finished")[0]).toMatchObject({
+			status: "failed",
+			superstep: 2,
+		});
+	});
+
 	it("attaches the listener error to the initial-activation invariant failure", async () => {
 		const listenerBoom = new Error("listener boom");
 		const data: CompiledGraphData<BasicState> = {
