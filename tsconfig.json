@@ -4,6 +4,12 @@
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "strict": true,
+    // 只跳过第三方 .d.ts 的检查（skipLibCheck 的粒度就到这）：pi-ai@1.0.4 发布的
+    // providers/*.models.d.ts 用 JSON import 却不带 `with { type: "json" }`（NodeNext
+    // 下 TS1543），其依赖链上的 @google/genai 又引用未安装的 @modelcontextprotocol/sdk
+    // 类型（TS2307）——全在 node_modules 里，不归本仓库修。src/tests 自己的代码仍按
+    // strict 全量检查。
+    "skipLibCheck": true,
     "types": ["node"]
   },
   "include": ["src", "tests"]
