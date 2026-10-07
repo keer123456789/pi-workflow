@@ -1,12 +1,43 @@
 /**
- * 执行引擎：超步（BSP）循环、触发/去重、条件边与 Send、状态提交
- * （设计 §5.1/§5.2/§5.3/§5.4/§5.5）。
+ * 执行引擎：超步（BSP）循环、触发/去重、条件边与 Send、状态提交、信号层级与取消
+ * （设计 §5.1/§5.2/§5.3/§5.4/§5.5、§7.1–§7.4、§4.4）。
  *
- * 结构（T11/T12 在同一骨架上扩展）：
- * (a) 超步编排 —— executeRun：pending 循环、recursionLimit、下一批激活（普通边 + router）；
- * (b) 实例执行 —— executeInstance：NodeContext 构造、输入冻结、handler 调用、事件；
+ * 结构（T12 在同一骨架上扩展）：
+ * (a) 超步编排 —— runGraph（executeRun 的 async 本体）：pending 循环、recursionLimit、
+ *     下一批激活（普通边 + router）；
+ * (b) 实例执行 —— executeInstance：NodeContext 构造、输入冻结、handler 调用、重试/超时、事件；
  * (c) 事件发射 —— src/log/emitter.ts（内存、完成序、全局 eventSeq）；
  * (d) 状态提交 —— commitSuperstep：结果按全局实例序（instanceSeq）排序后 foldUpdates。
+ *
+ * 信号层级（T11，§7.4）——三级单向派生，任何一级的 abort 都不会反向传播：
+ * - **run signal**：`AbortController`，触发条件 = 调用方 `options.signal`、`RunHandle.cancel()`、
+ *   `runTimeoutMs` 到期（§4.4）。`executeRun` 返回 `RunHandle`（promise + cancel 方法）
+ *   让调用方能中止运行中的 run；
+ * - **instance signal**：`AbortSignal.any([run signal, 每实例取消源])`——run 取消透传，
+ *   或同超步任一兄弟实例**重试耗尽后**失败时由引擎主动 abort（fail-fast，§7.1）；
+ * - **attempt signal**：`AbortSignal.any([instance signal, 本尝试超时源])`，每次尝试新建。
+ *   它才是 `ctx.signal`（types.ts 的 NodeContext 注释）。本尝试超时只 abort 它，
+ *   不影响下一次尝试，也不会反向 abort 实例/run。节点**必须**尊重它（§7.4:440）。
+ *
+ * fail-fast 取消与 collateral（T11，§7.1）：
+ * - 实例重试耗尽（或形状非法 / 未注册 / 退避服务故障）→ 立刻 abort 其余**仍在运行**的
+ *   兄弟实例（已 settle 的实例的信号不再被碰）；
+ * - 被取消且**未完成**的实例不是"失败"：不发 `node_failed`、不重试、不进根因选举，
+ *   只记进根因错误的 `NodeExecutionError.collateral`（按实例序）；
+ * - 根因 = 实例序最小的真失败（T10 的确定性选举不变）；已完成的兄弟结果照旧丢弃（不提交）；
+ * - run 取消/超时优先于实例失败：本超步整体不提交（`superstep_aborted`），run 以
+ *   `WorkflowError("run cancelled" / "run timed out after Xms")` 拒绝——不包 NodeExecutionError。
+ *
+ * 重试（T11，§7.2）：`retry.maxAttempts` 是**总尝试次数**（含首次，默认 1 = 不重试）。
+ * 非取消失败后按 full jitter 退避 `min(500 * 2^已重试次数 * random(), 30_000)`（注入的
+ * sleep/random，时序可测），每次重试前发 `node_retry`（attempt = 刚失败的那次尝试编号）。
+ * 取消类失败（run/兄弟取消引起的 AbortError 或 signal.reason 本体）**不重试**。
+ *
+ * 超时（T11，§7.3）：只有节点显式配置 `timeoutMs` 才有单次尝试超时（fn 无默认超时；
+ * llm/agent 的 120s/600s 默认值 M2 由节点工厂落进该字段）。到期 abort attempt signal，
+ * 且引擎不等待不检查信号的 handler——"handler settle vs 计时器"竞速，超时分支胜出即判失败
+ * （超时 = 可重试失败）；被放弃的 handler promise 已挂双回调 then，日后 reject 不会变成
+ * unhandled rejection。节点若不检查信号，其工作仍在后台继续——引擎只保证自己不再等它。
  *
  * 超步原子性（T10，§5.1:323-332）：
  * - 本超步全部实例跑完再决策（BSP）：任一实例失败 → **不提交**，事件边界
@@ -28,7 +59,7 @@
  * 触发规则（§5.4）：普通边目标与 router 字符串结果共享同一去重表（按节点名，保留最早
  * 实例）；Send 实例不去重，input 即 Send 载荷（§5.3）。router 每节点每超步求值一次，
  * 读提交后的合并 state 与该节点本超步自身写入的 fold（§4.2）。
- * 仍不含：预算/并发上限/取消信号层级（T11）、重试与超时（T12）。
+ * 仍不含：实例预算与并发上限（T12）；JSONL 落盘（log/runlog.ts）。
  *
  * 两个计数器互不相干（R2），都在 run 内全局单调：
  * - `instanceSeq`：NodeDefinition 的激活序 —— instanceId = `${name}#${seq}`，也是合并顺序（§5.2）；
@@ -61,11 +92,17 @@ import {
 	type ResolvedServices,
 	type Router,
 	type RouterResult,
+	type RunHandle,
 	type RunOptions,
 	type RunResult,
 	type Services,
 	START,
 } from "./types.js";
+
+/** 退避基数（§7.2）：500ms。 */
+const BASE_BACKOFF_MS = 500;
+/** 退避上限（§7.2）：30s。 */
+const MAX_BACKOFF_MS = 30_000;
 
 /** 待执行实例；input 是激活时刻 state 的只读快照（普通触发，设计 §5.1）。 */
 type Instance = {
@@ -98,12 +135,89 @@ export function resolveServices(services?: Services): ResolvedServices {
 	};
 }
 
-export async function executeRun<S extends object>(
+/**
+ * run 入口（T11 起返回 RunHandle，§4.4 的实现层细化）：{@link runGraph} 是 async 本体，
+ * 这里在外面持有 run 级 AbortController，把 `cancel()` 挂到 promise 对象上。
+ * promise 本体不被替换——`await` / `then` 的语义与从前完全一致。
+ */
+export function executeRun<S extends object>(
 	graph: CompiledGraphData<S>,
 	initial: S,
 	options: RunOptions,
 	services: ResolvedServices,
+): RunHandle<S> {
+	const runController = new AbortController();
+	// run 级资源的归置点（见 RunScope）：run 本体 settle 后由 handle 统一触发。
+	const runScope: RunScope = { finished: false, dispose: () => {} };
+	const promise = runGraph(
+		graph,
+		initial,
+		options,
+		services,
+		runController,
+		runScope,
+	);
+	return toRunHandle(promise, runController, () => {
+		runScope.finished = true;
+		runScope.dispose();
+	});
+}
+
+/**
+ * run 级资源的清理开关（T11）：run 取消/超时都建立在"run 还没结束"这个前提上，而"结束"
+ * 只有 async 本体 settle 才知道——由 executeRun 在 promise settle 时统一触发，避免在
+ * 每个退出路径（正常返回 / 各类 throw）上各写一遍清理。
+ */
+type RunScope = {
+	/** run 本体已结束：之后到点的 run 级定时器与外部 signal 都不再 abort。 */
+	finished: boolean;
+	/** 摘除 run 级监听（外部 signal 可能被调用方复用到下一个 run）。 */
+	dispose: () => void;
+};
+
+/**
+ * RunHandle 装配：`Object.assign` 给 promise 附加 `cancel`（不引入 Promise 子类——
+ * 子类要处理 `Object.setPrototypeOf` 之类的杂技，而调用方只用到 then/catch/cancel）。
+ *
+ * `cancel()`（§4.4）：abort run signal（reason 为 `WorkflowError("run cancelled")`），
+ * 幂等（AbortController 本身幂等）且 run 已 settle 后是 no-op。用一个只在记账的
+ * `then` 记录 settle——双回调让派生 promise 恒 resolve，不产生 unhandled rejection。
+ */
+function toRunHandle<S>(
+	promise: Promise<RunResult<S>>,
+	runController: AbortController,
+	onSettled: () => void,
+): RunHandle<S> {
+	let settled = false;
+	const markSettled = (): void => {
+		settled = true;
+		onSettled();
+	};
+	void promise.then(markSettled, markSettled);
+	return Object.assign(promise, {
+		cancel: (): void => {
+			if (settled) {
+				return;
+			}
+			runController.abort(new WorkflowError("run cancelled"));
+		},
+	});
+}
+
+async function runGraph<S extends object>(
+	graph: CompiledGraphData<S>,
+	initial: S,
+	options: RunOptions,
+	services: ResolvedServices,
+	runController: AbortController,
+	runScope: RunScope,
 ): Promise<RunResult<S>> {
+	// 开跑前就已 abort 的外部 signal（§7.4）：什么都没开始——零事件（连 run_started 都没有），
+	// 直接以 WorkflowError 拒绝。先于 stateSchema 校验：取消是调用方更强的意图表达。
+	const externalSignal = options.signal;
+	if (externalSignal?.aborted === true) {
+		throw new WorkflowError("run cancelled");
+	}
 	// §6.7：初始 state 校验在 run 开始前做——不合法则整个 run 不发生（一个事件都不发），
 	// 报错形态与 compile 期一致（GraphValidationError + issues）。
 	assertInitialState(graph, initial);
@@ -122,9 +236,52 @@ export async function executeRun<S extends object>(
 		requestedLimit !== undefined && Number.isFinite(requestedLimit)
 			? requestedLimit
 			: 25;
-	// T11 在这里接 run 级信号（options.signal / runTimeoutMs / 兄弟实例失败取消）：
-	// 本任务给节点的信号永不触发（节点仍应按 §7.4 的约定尊重 ctx.signal）。
-	const runSignal = new AbortController().signal;
+
+	// run 级信号（§7.4）：三条触发路径——外部 signal、RunHandle.cancel()、runTimeoutMs。
+	const runSignal = runController.signal;
+	/**
+	 * run 取消/超时的统一拒绝体（§4.4）：三条触发路径都以 WorkflowError 作为 abort reason，
+	 * 这里原样取回（同时把调用方自己的 abort 理由留在 cause 上）。
+	 */
+	const cancellationError = (): WorkflowError => {
+		const reason: unknown = runSignal.reason;
+		return reason instanceof WorkflowError
+			? reason
+			: new WorkflowError("run cancelled");
+	};
+
+	// 外部 signal 直达透传；run 结束即摘除监听（调用方可能把同一个 signal 复用到下一个 run）。
+	if (externalSignal !== undefined) {
+		const onExternalAbort = (): void => {
+			const error = new WorkflowError("run cancelled");
+			error.cause = externalSignal.reason;
+			runController.abort(error);
+		};
+		externalSignal.addEventListener("abort", onExternalAbort);
+		runScope.dispose = () => {
+			externalSignal.removeEventListener("abort", onExternalAbort);
+		};
+	}
+
+	// run 级超时（§7.3/§4.4）：到期 abort run signal。非有限 / <= 0 视为"无超时"
+	// （与 recursionLimit 的 NaN 兜底同一策略）；注入的 sleep 抛错时定时器直接不参与。
+	const runTimeoutMs = options.runTimeoutMs;
+	if (
+		runTimeoutMs !== undefined &&
+		Number.isFinite(runTimeoutMs) &&
+		runTimeoutMs > 0
+	) {
+		void services.sleep(runTimeoutMs).then(
+			() => {
+				if (!runScope.finished) {
+					runController.abort(
+						new WorkflowError(`run timed out after ${runTimeoutMs}ms`),
+					);
+				}
+			},
+			() => {},
+		);
+	}
 
 	let state: S = initial;
 	/** 已跑完的超步数（0 = 一个都没跑）；run_started 用 superstep 0。 */
@@ -180,6 +337,24 @@ export async function executeRun<S extends object>(
 			return;
 		}
 		(error as { listenerError?: unknown }).listenerError = listenerError;
+	};
+
+	/**
+	 * run 取消/超时的收尾（T11，§7.4）：`run_finished{failed}` + 抛 WorkflowError。
+	 * - `superstep` 即 run_finished.superstep——超步内取消 = 正在执行的超步编号，
+	 *   超步之间取消 = 已跑完的超步编号（R1 的"已执行"语义）；
+	 * - `boundary` 为真时补发 `superstep_aborted`：取消发生在超步内部，该超步整体不提交
+	 *   （与实例失败/提交失败的边界语义一致，消费方按最近的边界判定 committed）；
+	 * - 取消/超时**不包** NodeExecutionError（taxonomy 冻结，用 WorkflowError 基类）。
+	 */
+	const finishCancelledRun = (superstep: number, boundary: boolean): never => {
+		if (boundary) {
+			emitter.emit({ type: "superstep_aborted", superstep });
+		}
+		finishRun(superstep, "failed");
+		const error = cancellationError();
+		attachListenerError(error);
+		throw error;
 	};
 
 	/** 构造实例：分配全局实例序（R2），instanceId = `${name}#${seq}`。 */
@@ -270,6 +445,12 @@ export async function executeRun<S extends object>(
 			return { state, runId };
 		}
 
+		// run 取消/超时（§7.4）在超步边界生效：本超步不开始，事件里只有 run_finished{failed}
+		// （没有实例被激活，也就没有 superstep_aborted 边界）。
+		if (runSignal.aborted) {
+			finishCancelledRun(lastSuperstep, false);
+		}
+
 		const superstep = lastSuperstep + 1;
 		if (superstep > recursionLimit) {
 			// 只数"执行过的超步数"：limit 内跑满才越限（§5.1 的 step >= recursionLimit）。
@@ -282,48 +463,97 @@ export async function executeRun<S extends object>(
 			throw error;
 		}
 
-		// (b) 本超步实例并发执行（I/O 并发）。全部 settle 后再决策：
-		// 失败候选取实例序最小的那个（完成序不参与选择，确定性 §5.2）；
-		// 失败不取消兄弟实例——取消信号层级是 T11，未提交的写入在这里不会落地。
+		// (b) 本超步实例并发执行（I/O 并发）。每个实例一个取消源（fail-fast 用，§7.4）：
+		// 实例 settle 即从表里摘除——"仍在运行的兄弟实例"是 abort 的具体范围（已完成的
+		// 实例信号不再被碰）。
+		const instanceAborts = new Map<string, AbortController>();
+		const abortSiblingInstances = (failedInstanceId: string): void => {
+			const reason = new WorkflowError(
+				`instance "${failedInstanceId}" failed: cancelling sibling instances (fail-fast)`,
+			);
+			for (const [instanceId, controller] of instanceAborts) {
+				if (instanceId === failedInstanceId) {
+					continue;
+				}
+				controller.abort(reason);
+			}
+		};
+
+		// 全部 settle 后再决策：失败候选取实例序最小的那个（完成序不参与选择，确定性 §5.2）。
 		const settled = await Promise.allSettled(
-			pending.map((instance) =>
-				executeInstance({
+			pending.map((instance) => {
+				const controller = new AbortController();
+				instanceAborts.set(instance.instanceId, controller);
+				return executeInstance({
 					graph,
 					instance,
 					superstep,
 					runId,
-					signal: runSignal,
+					runSignal,
+					instanceController: controller,
+					abortSiblings: () => abortSiblingInstances(instance.instanceId),
 					emitter,
 					services,
-				}),
-			),
+				}).finally(() => {
+					instanceAborts.delete(instance.instanceId);
+				});
+			}),
 		);
+
+		// run 取消/超时优先于实例失败（§7.4）：本超步整体不提交，边界 superstep_aborted。
+		if (runSignal.aborted) {
+			finishCancelledRun(superstep, true);
+		}
+
 		let failure: unknown;
 		let hasFailure = false;
 		let failureSeq = Number.POSITIVE_INFINITY;
 		const succeeded: InstanceResult<S>[] = [];
+		/** 被 fail-fast 取消、未完成的实例（按实例序）——即 NodeExecutionError.collateral。 */
+		const collateral: string[] = [];
 		settled.forEach((settledResult, index) => {
+			const instance = pending[index];
 			if (settledResult.status === "fulfilled") {
 				succeeded.push(settledResult.value);
 				return;
 			}
-			const seq = pending[index].seq;
-			if (seq < failureSeq) {
-				failureSeq = seq;
+			if (settledResult.reason instanceof InstanceCancelledError) {
+				// 被取消（不是失败）：不发 node_failed、不参与根因选举，只记进 collateral
+				collateral.push(instance.instanceId);
+				return;
+			}
+			if (instance.seq < failureSeq) {
+				failureSeq = instance.seq;
 				failure = settledResult.reason;
 				hasFailure = true;
 			}
 		});
 
 		if (hasFailure) {
-			// 任一实例 handler 失败（含形状/未注册节点）→ 本超步**整体不提交**（原子性，
+			// 任一实例真失败（含形状/未注册节点）→ 本超步**整体不提交**（原子性，
 			// §5.1:323-325）：已完成的兄弟结果被丢弃，事件边界 superstep_aborted
-			// （node_failed 已在实例内逐个发出）。主失败原样抛出——监听器错误不在这里掩盖它。
-			// collateral（被连带取消的兄弟实例）与信号取消是 T11。
+			// （node_failed 已在实例内逐个发出）。主失败原样抛出——监听器错误不在这里掩盖它；
+			// collateral（被连带取消的兄弟实例）补进根因错误（failNode 先给空表，见其注释）。
+			if (failure instanceof NodeExecutionError) {
+				failure.collateral = collateral;
+			}
 			emitter.emit({ type: "superstep_aborted", superstep });
 			finishRun(superstep, "failed");
 			attachListenerError(failure);
 			throw failure;
+		}
+
+		if (collateral.length > 0) {
+			// 防御：取消必伴随 run 取消或某个兄弟的真失败，两者都在上面处理掉了。
+			// 走到这里说明内部不变量被破坏——响亮报错（事件边界照旧补全），
+			// 绝不把"没跑完"当"成功"提交。
+			emitter.emit({ type: "superstep_aborted", superstep });
+			finishRun(superstep, "failed");
+			const error = new WorkflowError(
+				`superstep ${superstep} has cancelled instances (${collateral.join(", ")}) but no failure to attribute them to`,
+			);
+			attachListenerError(error);
+			throw error;
 		}
 
 		// (d) 提交：按全局实例序升序折叠（§5.2），与完成顺序无关。
@@ -357,24 +587,57 @@ export async function executeRun<S extends object>(
 }
 
 /**
- * (b) 单个实例：node_started →（开发模式冻结输入）→ handler(input, ctx) → node_finished；
- * 失败（handler 抛错 / 返回形状非法）走 node_failed + NodeExecutionError（fail-fast）。
- * 本任务不重试（T12）、不因兄弟失败取消（T11），collateral 恒为空。
+ * (b) 单个实例：node_started →（开发模式冻结输入）→ 尝试循环（handler + 重试/超时）→
+ * node_finished；永久失败（重试耗尽 / 返回形状非法 / 未注册 / 退避服务故障）走
+ * node_failed + NodeExecutionError，并 fail-fast 取消仍在运行的兄弟实例。
+ *
+ * 信号（§7.4）：`instanceSignal = any([run signal, 本实例取消源])`——run 取消透传，
+ * 兄弟失败时由 abortSiblings 触发；`attemptSignal = any([instanceSignal, 本尝试超时源])`，
+ * 每次尝试新建，它就是 ctx.signal（types.ts 的 NodeContext 注释）。
+ * **尝试超时只 abort 本尝试**：不影响实例/run，也不影响下一次尝试。
+ *
+ * 取消（实例信号 abort 且失败由其引起）**不是失败**：抛 InstanceCancelledError，
+ * 不发 node_failed、不重试——由调用方记进 collateral（返回形状非法的失败不重试：
+ * 那是代码错误，与 §7.1"fn 不自动重试"同源；llm 的 schema 重试走 M2 的适配层）。
  */
 async function executeInstance<S extends object>(args: {
 	graph: CompiledGraphData<S>;
 	instance: Instance;
 	superstep: number;
 	runId: string;
-	signal: AbortSignal;
+	runSignal: AbortSignal;
+	instanceController: AbortController;
+	abortSiblings: () => void;
 	emitter: RunEmitter;
 	services: ResolvedServices;
 }): Promise<InstanceResult<S>> {
-	const { graph, instance, superstep, runId, signal, emitter, services } = args;
+	const {
+		graph,
+		instance,
+		superstep,
+		runId,
+		runSignal,
+		instanceController,
+		abortSiblings,
+		emitter,
+		services,
+	} = args;
+
+	// 防御：实例在开跑前就已被取消（当前调度下同批实例都在同一个同步块里启动，正常
+	// 到不了这里；取消的判定时机在实例内）。节点从未开始 → 不发任何事件（连 node_started
+	// 都没有）：记进 collateral 即完整的交代。
+	if (instanceController.signal.aborted || runSignal.aborted) {
+		throw new InstanceCancelledError(instance.instanceId);
+	}
+	const instanceSignal = AbortSignal.any([
+		runSignal,
+		instanceController.signal,
+	]);
 
 	const definition = graph.nodes.get(instance.node);
 	if (definition === undefined) {
 		// compile 校验保证激活目标都已注册（§6.1）；这里只防御手搓的图数据（不崩）。
+		abortSiblings();
 		throw new NodeExecutionError(
 			`node "${instance.node}" (${instance.instanceId}) is not registered`,
 			{
@@ -386,12 +649,16 @@ async function executeInstance<S extends object>(args: {
 		);
 	}
 
-	const ctx: NodeContext = {
-		runId,
-		superstep,
-		instanceId: instance.instanceId,
-		seq: instance.seq,
-		signal,
+	/** 实例永久失败：先 fail-fast 取消仍在运行的兄弟，再抛 NodeExecutionError（§7.1）。 */
+	const fail = (cause: unknown): never => {
+		abortSiblings();
+		throw failNode({
+			emitter,
+			superstep,
+			node: instance.node,
+			instanceId: instance.instanceId,
+			cause,
+		});
 	};
 
 	emitter.emit({
@@ -410,47 +677,268 @@ async function executeInstance<S extends object>(args: {
 	}
 
 	const startedAt = services.clock();
-	let output: unknown;
-	try {
-		output = await definition.handler(instance.input, ctx);
-	} catch (cause) {
-		throw failNode({
-			emitter,
+	const maxAttempts = resolveMaxAttempts(definition.retry);
+	const timeoutMs = resolveTimeoutMs(definition.timeoutMs);
+
+	for (let attempt = 1; ; attempt += 1) {
+		// 实例信号已取消（run 取消 / 兄弟失败，含退避期间被打断）：本实例不再继续。
+		if (instanceSignal.aborted) {
+			throw new InstanceCancelledError(instance.instanceId);
+		}
+
+		const attemptController = new AbortController();
+		const attemptSignal = AbortSignal.any([
+			instanceSignal,
+			attemptController.signal,
+		]);
+		const ctx: NodeContext = {
+			runId,
+			superstep,
+			instanceId: instance.instanceId,
+			seq: instance.seq,
+			signal: attemptSignal,
+		};
+
+		const outcome = await raceAttempt({
+			// async 包装：同步抛错的 handler 也变成 rejection（与 handler 返回 promise 同路）
+			invoke: async () => definition.handler(instance.input, ctx),
+			timeoutMs,
+			makeTimeoutError: () =>
+				new WorkflowError(
+					`node "${instance.node}" (${instance.instanceId}) attempt ${attempt} timed out after ${timeoutMs}ms`,
+				),
+			abortAttempt: (error) => attemptController.abort(error),
+			sleep: services.sleep,
+		});
+
+		if (outcome.status === "fulfilled") {
+			const output = outcome.value;
+			// 返回形状：数组 / 原始值不是合法的 Partial<S>——曾经被静默当无写入（T8 review），
+			// 掩盖 bug，现在按节点失败处理（有 writeTo 的节点例外，见 shapeFailureOf）。
+			const shapeError = shapeFailureOf(definition, output);
+			if (shapeError !== undefined) {
+				fail(shapeError);
+			}
+			emitter.emit({
+				type: "node_finished",
+				superstep,
+				node: instance.node,
+				instanceId: instance.instanceId,
+				output,
+				durationMs: elapsedMs(services, startedAt),
+			});
+			return { instance, update: updateOf(definition, output) };
+		}
+
+		const cause = outcome.error;
+		// 取消不是失败（§7.4）：实例信号已取消，且错误由该取消引起（AbortError / signal.reason）
+		// → 不重试、不发 node_failed，交给调用方记进 collateral。节点自身内部的 AbortError
+		// （如嵌套请求超时）不算取消，仍按可重试失败处理（§7.2 的 timeout 类）。
+		if (instanceSignal.aborted && causedByCancellation(cause, attemptSignal)) {
+			throw new InstanceCancelledError(instance.instanceId);
+		}
+		if (attempt >= maxAttempts) {
+			// 重试耗尽 = 实例失败（根因取最后一次尝试的错误）
+			fail(cause);
+		}
+
+		// 重试（§7.2）：发 node_retry（attempt = 刚失败的那次尝试编号），退避后进入下一次尝试。
+		emitter.emit({
+			type: "node_retry",
 			superstep,
 			node: instance.node,
 			instanceId: instance.instanceId,
-			cause,
+			attempt,
+			error: messageOf(cause),
 		});
+		try {
+			// 已取消就不要再武装退避定时器（下一轮循环顶部的检查直接收尾）；
+			// 退避期间被打断则由 raceWithAbort 立刻返回，不必等满窗口。
+			if (!instanceSignal.aborted) {
+				await raceWithAbort(
+					services.sleep(backoffMs(attempt, services)),
+					instanceSignal,
+				);
+			}
+		} catch (sleepError) {
+			// 注入的 sleep 故障：按本节点失败处理（不再重试——退避服务坏了重试也一样）。
+			if (instanceSignal.aborted) {
+				throw new InstanceCancelledError(instance.instanceId);
+			}
+			fail(sleepError);
+		}
+	}
+}
+
+/**
+ * 内部信号量（不出公开 API）：实例被取消、未完成。**不是**节点失败——不发 node_failed、
+ * 不重试、不参与根因选举；调用方（runGraph）据此把它记进 collateral。
+ */
+class InstanceCancelledError extends Error {
+	constructor(instanceId: string) {
+		super(`instance "${instanceId}" was cancelled`);
+		this.name = "InstanceCancelledError";
+	}
+}
+
+/**
+ * 失败是否由信号取消引起（§7.4 的"取消 vs 失败"判定）：AbortError 形态，或节点直接
+ * reject 了 `signal.reason` 本体。调用方还要求 instance signal 已取消——这样节点自身
+ * 内部产生的 AbortError（嵌套请求超时等）不会被误判成取消。
+ */
+function causedByCancellation(
+	error: unknown,
+	attemptSignal: AbortSignal,
+): boolean {
+	if (
+		typeof error === "object" &&
+		error !== null &&
+		(error as { name?: unknown }).name === "AbortError"
+	) {
+		return true;
+	}
+	return error === attemptSignal.reason;
+}
+
+/**
+ * 单次尝试的判定：handler 的 settle 与超时二者抢先（§7.3/§7.4）。
+ *
+ * - 超时 = 本尝试失败（可重试），并被**统一渲染**成 `makeTimeoutError()`——即使 handler
+ *   在信号 abort 的那一刻抢先 reject 了 AbortError，也不让"超时"退化成裸 AbortError；
+ * - 注入的 sleep 抛错时超时分支不参与竞争（handler 的结果说了算）；
+ * - **引擎不因超时永远挂起**：handler 永不 settle 时靠超时分支返回。被放弃的 handler
+ *   promise 已挂双回调 then——它此后 reject 也不会变成 unhandled rejection；
+ * - 尝试 settle 后到点的定时器不再 abort（armed 闸门）：不惊扰已结束的尝试，更不影响
+ *   下一次尝试（每次尝试的超时源都是新的）。
+ */
+async function raceAttempt(args: {
+	invoke: () => Promise<unknown>;
+	timeoutMs: number | undefined;
+	makeTimeoutError: () => WorkflowError;
+	abortAttempt: (error: WorkflowError) => void;
+	sleep: (ms: number) => Promise<void>;
+}): Promise<AttemptOutcome> {
+	// handler 的两种 settle 都在这里被消费（即便结果被放弃，也不会漏出 unhandled rejection）。
+	const handlerOutcome = args.invoke().then(
+		(value): AttemptOutcome => ({ status: "fulfilled", value }),
+		(error): AttemptOutcome => ({ status: "failed", error }),
+	);
+	const timeoutMs = args.timeoutMs;
+	if (timeoutMs === undefined) {
+		return handlerOutcome;
 	}
 
-	// 返回形状：数组 / 原始值不是合法的 Partial<S>——曾经被静默当无写入（T8 review），
-	// 掩盖 bug，现在按节点失败处理（有 writeTo 的节点例外，见 shapeFailureOf）。
-	const shapeError = shapeFailureOf(definition, output);
-	if (shapeError !== undefined) {
-		throw failNode({
-			emitter,
-			superstep,
-			node: instance.node,
-			instanceId: instance.instanceId,
-			cause: shapeError,
-		});
-	}
-
-	emitter.emit({
-		type: "node_finished",
-		superstep,
-		node: instance.node,
-		instanceId: instance.instanceId,
-		output,
-		durationMs: elapsedMs(services, startedAt),
+	/** armed = 本尝试仍在等待（定时器到点时若已 settle 就作废）。 */
+	const timer: { armed: boolean; error: WorkflowError | undefined } = {
+		armed: true,
+		error: undefined,
+	};
+	const timeoutOutcome = new Promise<AttemptOutcome>((resolve) => {
+		void args.sleep(timeoutMs).then(
+			() => {
+				if (!timer.armed) {
+					return; // 尝试已结束：本分支不参与竞争（也不 abort 任何东西）
+				}
+				timer.armed = false;
+				const error = args.makeTimeoutError();
+				timer.error = error;
+				args.abortAttempt(error);
+				resolve({ status: "failed", error });
+			},
+			() => {}, // 注入的 sleep 抛错：超时分支不参与竞争
+		);
 	});
+	const outcome = await Promise.race([handlerOutcome, timeoutOutcome]);
+	timer.armed = false;
+	return timer.error !== undefined
+		? { status: "failed", error: timer.error }
+		: outcome;
+}
 
-	return { instance, update: updateOf(definition, output) };
+type AttemptOutcome =
+	| { status: "fulfilled"; value: unknown }
+	| { status: "failed"; error: unknown };
+
+/**
+ * 等待 `promise`，但信号取消时立即返回——退避 sleep 因此可被打断，取消不必等满退避窗口。
+ * rejection 原样传播（调用方按"退避服务故障 = 节点失败"处理）；信号监听器在结束时摘除
+ * （多次重试不会在同一个信号上累积监听器）。
+ */
+async function raceWithAbort(
+	promise: Promise<void>,
+	signal: AbortSignal,
+): Promise<void> {
+	if (signal.aborted) {
+		return;
+	}
+	let onAbort: (() => void) | undefined;
+	try {
+		await Promise.race([
+			promise,
+			new Promise<void>((resolve) => {
+				onAbort = () => resolve();
+				signal.addEventListener("abort", onAbort, { once: true });
+			}),
+		]);
+	} finally {
+		if (onAbort !== undefined) {
+			signal.removeEventListener("abort", onAbort);
+		}
+	}
+}
+
+/**
+ * full jitter 退避（§7.2）：`min(500 * 2^已重试次数 * random(), 30_000)`。
+ * 指数用"已重试次数"（0 起）——首次重试的基数即设计的 base 500ms。
+ * random 越界（注入的假实现）夹到 [0, 1]、非有限归 0：退避时长永远是合法毫秒数。
+ */
+function backoffMs(failedAttempt: number, services: ResolvedServices): number {
+	const retriesSoFar = failedAttempt - 1;
+	const jitter = services.random();
+	const safeJitter = Number.isFinite(jitter)
+		? Math.min(1, Math.max(0, jitter))
+		: 0;
+	return Math.min(
+		BASE_BACKOFF_MS * 2 ** retriesSoFar * safeJitter,
+		MAX_BACKOFF_MS,
+	);
+}
+
+/**
+ * `retry.maxAttempts` 是**总尝试次数**（含首次，设计 §7.2）：默认 1（不重试）。
+ * 非有限 / < 1 一律回落 1——NaN 会让 `attempt >= maxAttempts` 永远为假（无限重试）、
+ * Infinity 同理，与 recursionLimit 的兜底同一策略；小数向下取整。
+ */
+function resolveMaxAttempts(
+	retry: { maxAttempts: number } | undefined,
+): number {
+	const requested = retry?.maxAttempts;
+	if (requested === undefined || !Number.isFinite(requested) || requested < 1) {
+		return 1;
+	}
+	return Math.floor(requested);
+}
+
+/**
+ * 单次尝试的超时（§7.3）：只有节点显式配置 `timeoutMs` 才生效（fn 无默认超时；
+ * llm/agent 的 120s/600s 默认值由 M2 的节点工厂落进该字段，引擎只认字段）。
+ * 非有限 / <= 0 视为"无超时"（与 runTimeoutMs 同一兜底）。
+ */
+function resolveTimeoutMs(timeoutMs: number | undefined): number | undefined {
+	if (
+		timeoutMs === undefined ||
+		!Number.isFinite(timeoutMs) ||
+		timeoutMs <= 0
+	) {
+		return undefined;
+	}
+	return timeoutMs;
 }
 
 /**
  * 节点失败路径（§7.1）：发 `node_failed` 并返回待抛的 `NodeExecutionError`
- * （根因节点 + instanceId + cause）。collateral 与信号取消是 T11，这里恒为空。
+ * （根因节点 + instanceId + cause）。`collateral` 先给空表——被连带取消的兄弟实例要到
+ * 本超步全部 settle 才清楚，由 runGraph 在根因错误上回填（同一对象，见那里的注释）。
  */
 function failNode(args: {
 	emitter: RunEmitter;

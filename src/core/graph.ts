@@ -26,8 +26,8 @@ import {
 	type GraphCfg,
 	type NodeDefinition,
 	type Router,
+	type RunHandle,
 	type RunOptions,
-	type RunResult,
 	START,
 } from "./types.js";
 
@@ -141,7 +141,8 @@ export class StateGraph<S extends object> {
 		const resolvedServices = resolveServices(opts?.services);
 
 		// 引擎接线（Task 8）：run 与 invoke 同一入口，options 缺省为 {}。
-		const run = (initial: S, options?: RunOptions): Promise<RunResult<S>> =>
+		// 返回 RunHandle（T11）：promise 本体 + cancel()（中止运行中的 run，§4.4/§7.4）。
+		const run = (initial: S, options?: RunOptions): RunHandle<S> =>
 			executeRun(data, initial, options ?? {}, resolvedServices);
 
 		// 具体对象额外携带装配好的 data（结构子类型，公开面仍是 CompiledGraph<S>）：

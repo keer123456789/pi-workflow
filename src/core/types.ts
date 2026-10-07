@@ -21,6 +21,14 @@ export type NodeContext = {
 	superstep: number;
 	instanceId: string;
 	seq: number;
+	/**
+	 * **attempt signal**（设计 §7.4 三级信号里节点能看到的那一级）：从实例信号派生、
+	 * 每次重试新建（本尝试超时只 abort 它，不影响下一次尝试）。
+	 *
+	 * 触发条件：run 级取消（调用方 signal / RunHandle.cancel() / runTimeoutMs 到期）、
+	 * 同超步兄弟实例失败（fail-fast）、本尝试 `timeoutMs` 到期。
+	 * 节点**必须**尊重它（长循环里周期性检查，§7.4:440）——引擎无法抢占不检查信号的节点。
+	 */
 	signal: AbortSignal;
 };
 
@@ -167,6 +175,21 @@ export type RunEvent =
 			superstep: number;
 			ts: number;
 			runId: string;
+			/**
+			 * 瞬态失败后的重试（§7.2/§8.1）：每次重试前发一条。
+			 * `attempt` = **刚失败的那次尝试**编号（1 起）；`error` = 失败错误的消息文本。
+			 */
+			type: "node_retry";
+			node: string;
+			instanceId: string;
+			attempt: number;
+			error: string;
+	  }
+	| {
+			seq: number;
+			superstep: number;
+			ts: number;
+			runId: string;
 			type: "node_failed";
 			node: string;
 			instanceId: string;
@@ -216,9 +239,20 @@ export type RunOptions = {
 /** run() 的产物（注意：不是裸 state，与 langgraph 的 invoke 有差异，设计 §12）。 */
 export type RunResult<S> = { state: S; runId: string };
 
+/**
+ * run()/invoke() 的句柄（设计 §4.4 的实现层细化，T11）：await 得到 `RunResult`，
+ * 另可 `cancel()` 中止本次 run（abort run signal，§7.4 的 run 级取消）。
+ * 实现形态：promise 本体附加 cancel 方法（不引入 Promise 子类）——`then`/`catch` 与
+ * 普通 promise 完全一致，`then` 的产物是普通 promise（不再带 cancel）。
+ */
+export interface RunHandle<S> extends Promise<RunResult<S>> {
+	/** 中止本次 run：幂等；run 已 settle 后是 no-op。 */
+	cancel(): void;
+}
+
 /** compile() 的产物；invoke 是 run 的别名（Task 6 封印、Task 8 引擎接线）。 */
 export type CompiledGraph<S> = {
 	readonly name: string;
-	run(initial: S, options?: RunOptions): Promise<RunResult<S>>;
+	run(initial: S, options?: RunOptions): RunHandle<S>;
 	invoke: CompiledGraph<S>["run"];
 };

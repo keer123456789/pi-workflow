@@ -259,8 +259,10 @@ const { state, runId } = await app.run(initialState, {
   logOutputs?: "full" | "hash";       // 默认 "full"
   onLogError?: "fail" | "warn";       // 默认 "fail"（法律审计场景日志不可静默丢失）
 });
-// 也有 run.cancel()（对运行中 handle 调用）与 langgraph 风格的 invoke() 别名——
-// 但注意 invoke() 返回 { state, runId } 而非裸 state，差异见 §12。
+// run()/invoke() 返回 RunHandle<S> = Promise<{ state, runId }> & { cancel(): void }：
+// 对运行中的 handle 调 cancel() 即中止本次 run（abort run signal，§7.4 的 run 级取消），
+// 幂等且 run 已 settle 后是 no-op；拒绝体是 WorkflowError("run cancelled")。
+// 也有 langgraph 风格的 invoke() 别名——但注意 invoke() 返回 { state, runId } 而非裸 state，差异见 §12。
 ```
 
 ### 4.5 标准 reducer（库导出）
@@ -437,7 +439,7 @@ for step in 0..:
 | instance signal | run signal 透传，**或同超步任一兄弟实例失败** | 节点应尽快退出；不因自身重试触发 |
 | attempt signal | 从 instance signal 派生，每次重试新建 | 单次尝试的超时控制；本尝试失败不影响后续尝试 |
 
-约定：**所有节点（含 fn）必须尊重 `ctx.signal`**（长循环里周期性检查）；引擎无法抢占不检查信号的 fn，文档显式说明。fn 的 `timeoutMs` 到期只能触发信号，靠节点自身响应。
+约定：**所有节点（含 fn）必须尊重 `ctx.signal`**（长循环里周期性检查）；引擎无法抢占不检查信号的 fn，文档显式说明。fn 的 `timeoutMs` 到期只能触发信号，靠节点自身响应——引擎只保证自己不再等它：超时的尝试按"handler settle vs 计时器"竞速判定，超时分支胜出即判失败（可重试），被放弃的 handler 若仍在跑属于节点自身失控，其 promise 已被引擎接管（reject 不会变成 unhandled rejection）。
 
 ### 7.5 运行期路由错误
 
@@ -454,13 +456,14 @@ for step in 0..:
 ```jsonl
 {"ts":"...","seq":0,"type":"run_started","runId":"...","graph":"contract-review","superstep":0,"input":{...}}
 {"ts":"...","seq":3,"type":"node_started","runId":"...","superstep":2,"node":"review","instanceId":"review#7","seq":7,"kind":"llm","input":{...}}
-{"ts":"...","seq":8,"type":"node_retry","runId":"...","instanceId":"review#7","attempt":2,"error":"429 rate limit"}
+{"ts":"...","seq":8,"superstep":2,"type":"node_retry","runId":"...","node":"review","instanceId":"review#7","attempt":2,"error":"429 rate limit"}
 {"ts":"...","seq":9,"type":"node_finished","runId":"...","superstep":2,"instanceId":"review#7","output":{...},"usage":{"tokens":1234},"durationMs":4200}
 {"ts":"...","seq":12,"type":"superstep_committed","runId":"...","superstep":2}
 {"ts":"...","type":"run_finished","runId":"...","status":"completed|failed","durationMs":...}
 ```
 
 - **所有事件带 `seq` 与 `superstep`**；失败超步的事件打标 `committed:false`，并追加 `superstep_aborted` 事件——事件溯源重放（v2）只重放 committed 超步；
+- `node_retry`（每次重试前一条）字段 = 样例的 `node` / `instanceId` / `attempt` / `error`；`attempt` 是**刚失败的那次尝试**编号（1 起），`error` 是失败错误的消息文本；
 - 事件同时经 `onEvent` 实时发出：**顺序保证 = 完成序（实时性优先）**，字段 `seq` 供需要全序的消费者（重放、审计）重排；
 - `logOutputs: "hash"` 模式下 input/output 只记 SHA-256（法律文书敏感；`onEvent` 同样受此开关约束，避免全文经回调泄露）；
 - 日志写失败：默认 `onLogError: "fail"` 使 run 失败（审计要求），可配 `"warn"` 降级；
