@@ -142,6 +142,20 @@ describe("compile validation: reference existence (设计 §6.1)", () => {
 		expect(error.issues[0]).toContain('edge source "ghost"');
 	});
 
+	it("reports an unregistered source of an END edge (R2)", () => {
+		// END 边不在 plainEdges 里，只登记在 endEdgeSources——漏扫它会放过这类悬空引用
+		const graph = new StateGraph<State>()
+			.addNode("load_doc", fnNode<State>(noop))
+			.addEdge(START, "load_doc")
+			.addEdge("load_doc", END)
+			.addEdge("load_docs", END);
+
+		const error = captureIssues(() => graph.compile());
+
+		expect(error.issues).toHaveLength(1);
+		expect(error.issues[0]).toContain('edge source "load_docs"');
+	});
+
 	it("reports an unregistered router source", () => {
 		const graph = minimal().addConditionalEdges("ghost", () => END);
 
@@ -321,6 +335,19 @@ describe("compile validation: writeTo (设计 §6.5)", () => {
 		expect(() => graph.compile()).not.toThrow();
 	});
 
+	it("treats a null stateSchema as an unknown universe (R2)", () => {
+		// 未经检查的 JS 调用方：不能从 compile 里抛裸 TypeError
+		const cfg = { stateSchema: null } as unknown as GraphCfg<State>;
+		const graph = minimal(cfg).addNode("summary", {
+			kind: "llm",
+			name: "",
+			handler: noop,
+			writeTo: "anything",
+		});
+
+		expect(() => graph.compile()).not.toThrow();
+	});
+
 	it("checks the key of an fn node that declares writeTo", () => {
 		const stateSchema = Type.Object({ count: Type.Number() });
 		const graph = minimal({ stateSchema }).addNode("worker", {
@@ -354,6 +381,10 @@ describe("compile warnings: unreachable nodes (设计 §6.2, R13)", () => {
 		const data = dataOf(graph);
 
 		expect(data.warnings).toHaveLength(2);
+		// 逐字固定一条警告（R12：纯文本，无 "warning:" 前缀等任何前缀）
+		expect(data.warnings).toContain(
+			'node "orphan" is not reachable from START',
+		);
 		for (const name of ["orphan", "orphan2"]) {
 			expect(data.warnings.some((w) => w.includes(`"${name}"`))).toBe(true);
 		}
@@ -417,8 +448,10 @@ describe("compile warnings: terminal nodes (设计 §6.3)", () => {
 		const data = dataOf(graph);
 
 		expect(data.warnings).toHaveLength(1);
-		expect(data.warnings[0]).toContain('"a"');
-		expect(data.warnings[0]).toContain("END");
+		// 逐字固定终态警告文案（R12：无 "warning:" 前缀）
+		expect(data.warnings[0]).toBe(
+			'node "a" has no outgoing edge and no router: it is a terminal state — connect it to END explicitly with addEdge("a", END)',
+		);
 	});
 
 	it("does not warn for a node explicitly wired to END", () => {

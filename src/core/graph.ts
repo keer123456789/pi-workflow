@@ -186,6 +186,14 @@ export class StateGraph<S extends object> {
 				}
 			}
 		}
+		// END 边不在 plainEdges 里（构建器契约），它们的 from 同样要查存在性——
+		// 否则 addEdge("typo", END) 这类悬空引用会静默通过（§6.1 的典型拼写错误）。
+		// END 作起点按 R1 裁定保持豁免（与普通边的起点豁免一致）。
+		for (const from of this.endEdgeSources) {
+			if (from !== START && from !== END && !this.nodes.has(from)) {
+				issues.push(`edge source "${from}" is not a registered node`);
+			}
+		}
 		for (const from of this.routers.keys()) {
 			if (from !== START && !this.nodes.has(from)) {
 				issues.push(`router source "${from}" is not a registered node`);
@@ -236,15 +244,15 @@ export class StateGraph<S extends object> {
 	 * channels 不能当宇宙：`StateSchema<S>` 是 Partial 映射，只列"有自定义 reducer"的 key，
 	 * 而没有 reducer 的 key 合法可写（§5.1 直接覆盖写入）——拿 channels 当全集会把
 	 * `writeTo: "title"` + `channels: { logs: append }` 这类合法图判错。
-	 * 无 stateSchema（或它给不出可枚举的 properties）→ undefined = 宇宙未知，跳过校验。
+	 * 无 stateSchema（或它不是对象、给不出可枚举的 properties）→ undefined = 宇宙未知，
+	 * 跳过校验。非对象值（如 JS 调用方传的 `null`）也走这条路，绝不让裸 TypeError 逃出 compile。
 	 * 原则：宁可漏报，绝不误报。
 	 */
 	private stateKeyUniverse(): Set<string> | undefined {
-		if (this.stateSchema === undefined) {
+		if (!isRecord(this.stateSchema)) {
 			return undefined;
 		}
-		const properties = (this.stateSchema as { properties?: unknown })
-			.properties;
+		const properties = this.stateSchema.properties;
 		return isRecord(properties) ? new Set(Object.keys(properties)) : undefined;
 	}
 
