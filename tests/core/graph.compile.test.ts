@@ -12,7 +12,7 @@
  */
 
 import { Type } from "typebox";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
 	GraphSealedError,
@@ -24,11 +24,16 @@ import { append, type StateSchema } from "../../src/core/state.js";
 import {
 	type CompiledGraph,
 	type CompiledGraphData,
+	type CompileOptions,
 	END,
 	type GraphCfg,
+	type RunEvent,
 	START,
 } from "../../src/core/types.js";
 import { fnNode } from "../../src/nodes/fn.js";
+import { llmNode } from "../../src/nodes/llm.js";
+import type { CompleteFn } from "../../src/runtime/executor.js";
+import { defaultPiAiComplete } from "../../src/runtime/llm-pi-ai.js";
 
 type State = { count: number; log: string[] };
 
@@ -689,16 +694,8 @@ describe("compile: valid graphs (name precedence)", () => {
 // 可用性由 `vi.mock("../../src/runtime/llm-pi-ai.js")` 控制（T7 review 要求在本任务覆盖
 // "对等依赖未安装"的 false 路径）：mock 默认 available = true，与"pi-ai 真的装在
 // devDependencies 里"的真实探测一致——本文件此前的用例行为不变；不可用路径逐例显式置
-// false 并在 finally 复位。本节整体追加在文件末尾：vi.mock / vi.hoisted 由 vitest 提升、
-// import 由 ESM 提升，位置不影响语义。
+// false 并在 finally 复位。
 // ---------------------------------------------------------------------------
-
-import { vi } from "vitest";
-
-import type { CompileOptions, RunEvent } from "../../src/core/types.js";
-import { llmNode } from "../../src/nodes/llm.js";
-import type { CompleteFn } from "../../src/runtime/executor.js";
-import { defaultPiAiComplete } from "../../src/runtime/llm-pi-ai.js";
 
 /** 假 llm-pi-ai 模块的状态（vi.hoisted：mock 工厂先于 import 执行，必须同层提前建好）。 */
 const piAi = vi.hoisted(() => ({
@@ -870,6 +867,35 @@ describe("compile: llm completion resolution (§6.6/D12, Task 8)", () => {
 					issue.includes('node "worker" (kind "fn") must not declare complete'),
 				),
 			).toBe(true);
+		});
+	});
+
+	it("probes pi-ai once per compile even when several llm nodes lack a completion", () => {
+		piAi.probes = 0;
+
+		asUnavailable(() => {
+			const graph = llmGraph().addNode(
+				"draft2",
+				llmNode<State, "log">({
+					prompt: "again {count}",
+					schema: draftSchema,
+					writeTo: "log",
+				}),
+			);
+
+			const error = captureIssues(() => graph.compile());
+
+			// 两个缺补全的 llm 节点各报一条（全量收集，注册序）
+			expect(error.issues).toHaveLength(2);
+			expect(error.issues[0]).toContain(
+				'node "draft" (kind "llm") has no completion implementation',
+			);
+			expect(error.issues[1]).toContain(
+				'node "draft2" (kind "llm") has no completion implementation',
+			);
+			// 探测闸门：整个 compile 只探一次（探测结果在本次解析里复用，
+			// "每个节点各探一次"的坏实现在这里挂）
+			expect(piAi.probes).toBe(1);
 		});
 	});
 

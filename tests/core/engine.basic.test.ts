@@ -13,6 +13,7 @@
  * 本任务不含 router/Send/预算/取消/重试（T9–T12）。
  */
 
+import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 
 import { executeRun, resolveServices } from "../../src/core/engine.js";
@@ -33,7 +34,8 @@ import {
 	START,
 } from "../../src/core/types.js";
 import { fnNode } from "../../src/nodes/fn.js";
-import type { TokenUsage } from "../../src/runtime/executor.js";
+import { llmNode } from "../../src/nodes/llm.js";
+import type { CompleteFn, TokenUsage } from "../../src/runtime/executor.js";
 
 /** 任务 brief 的 `g.run(...)` 简写：编译（无参）后跑一次。 */
 function run<S extends object>(
@@ -687,11 +689,6 @@ describe("engine: usage propagation (D11)", () => {
 // Task 8：llm 节点端到端——compile 期解析 services.complete 并绑定（§6.6/D12），
 // 引擎负责 writeTo 包装（§5.1:354）与 node_finished（§8）。
 // ---------------------------------------------------------------------------
-
-import { Type } from "typebox";
-
-import { llmNode } from "../../src/nodes/llm.js";
-import type { CompleteFn } from "../../src/runtime/executor.js";
 
 describe("engine: llm node end-to-end (Task 8, §4.3/§6.6)", () => {
 	it("runs an llm node bound via services.complete: prompt interpolation, writeTo wrapping, node_finished", async () => {
