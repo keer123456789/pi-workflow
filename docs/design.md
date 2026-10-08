@@ -516,7 +516,7 @@ core 只认识这两个接口。`executor: "subprocess" | "sdk"` 是语法糖，
 > 协议细节以《docs/runtime-protocol.md》为准（M0 spike 实测冻结）。以下为适配器实现要点。
 
 - 命令：`pi --mode json -p --no-session [--model M] [--tools a,b,c]`，task 文本优先走 **stdin**（Windows argv 上限 ~32k，合同全文走 argv 不可靠；stdin 不可行则落临时文件）；**M0 实测补充**：stdin 是"读到 EOF 为止"——spawn 时**必须关闭 stdin**（`stdio:"ignore"` 或写完即 `end()`），保持打开不关会令 pi 无限期阻塞；stdin 与 argv 同时给会**无分隔符拼接**，适配器二者只取其一；
-- **临时文件生命周期**（法律文书敏感）：写入 `os.tmpdir()` 下本次 run 专属子目录，`finally` 中删除，失败时保留并在日志记录路径；不设额外权限位（继承用户默认）；
+- **临时文件生命周期**（法律文书敏感）：写入 `os.tmpdir()` 下本次 run 专属子目录，`finally` 中删除，失败时保留并在日志记录路径；不设额外权限位（继承用户默认）；M3 裁定（D17）：stdin 是唯一 task 通道（M0 ③.3 实测 40k 逐字节可靠），临时文件回退分支不实现——验收行"临时文件清理"豁免。
 - 解析 stdout 逐行 JSON 事件流：**首行为 session header（`type:"session"`，`--no-session` 也输出）需跳过**；累计最终 assistant 文本（`message_end`/`turn_end` 的 assistant `content[].text`，`agent_end.messages` 为权威副本）与 usage（assistant 消息对象内，含 `input/output/cacheRead/cacheWrite/totalTokens/cost`）；**LLM 失败时进程退出码仍为 0（json 模式实测），成败必须依据事件流中 assistant 消息的 `stopReason`（`"error"`/`"aborted"`，后者未实测）与 `errorMessage` 判定；但启动期错误（模型不存在/无凭据）退出码 1、错误只在 stderr，stdout 无事件流（无凭据场景仍有 182B 的 session header 行）——两套判定都要做**；**事件流格式与 pi CLI 版本绑定**：适配器启动时执行 `pi --version` 探测（输出单行裸 semver），仅支持已验证的版本区间，超出区间报明确错误（CLI 版本 ≠ SDK 包版本 1.0.4，二者独立跟踪）；
 - schema 产出：task 末尾（插值后）追加"最终输出只包含符合以下 JSON Schema 的 JSON"指令 → 解析（剥栅栏）→ typebox 校验 → 失败按重试策略重发；v2 演进为 pi-agents 式 RPC 结果信封工具；
 - Windows spawn：处理 `.cmd` shim（`shell:true` 或 cross-spawn，npm shim 为 `%APPDATA%/npm/{pi,pi.cmd,pi.ps1}`）；杀进程用 `taskkill /PID <spawn 返回的 pid> /T /F`（`/T` 不可省：shell:true 下句柄 PID 是 cmd.exe，pi 本体是其孙进程）（§7.3）；
@@ -615,7 +615,7 @@ pi-workflow/
 | **M0** | **pi subprocess 协议 spike**：验证 stdin 传 prompt、JSON 事件流格式（冻结字段清单）、schema 指令可行性、Windows spawn/taskkill、CLI 版本探测 | 产出《子进程协议》小节并入 §9.2；此后协议变更视为破坏性 |
 | M1 | core 引擎：图构建/校验/封印/超步/去重/seq/预算/信号层级/模板 | §12 的 core 测试与确定性测试全绿 —— **完成**（M1 核心引擎，公开面见 src/index.ts） |
 | M2 | llm 节点 + pi-ai 默认 complete + run 日志 | schema 校验与 maxAttempts 重试生效；run.jsonl 落盘且含 seq/superstep/committed 标记（committed = `superstep_committed`/`superstep_aborted` 边界事件，见 §8.1）—— **完成**（llmNode / JSONL 日志 / pi-ai 适配器见 src/nodes/llm.ts、src/log/runlog.ts、src/runtime/llm-pi-ai.ts） |
-| M3 | subprocess 适配器 | 真实 pi CLI 联调按 M0 协议通过；超时 taskkill、usage 统计、临时文件清理 |
+| M3 | subprocess 适配器 | 真实 pi CLI 联调按 M0 协议通过；超时 taskkill、usage 统计、临时文件清理—— **完成**（agentNode / subprocess 适配器见 src/nodes/agent.ts、src/runtime/pi-subprocess.ts） |
 | M4 | sdk 适配器 | 进程内跑通 agent 节点；optional peer 生效 |
 | M5 | README、合同审查完整示例、发布准备 | npm pack 可安装；示例开箱即跑；langgraph 黄金用例全绿 |
 

@@ -2,10 +2,12 @@
  * Task 13：包公开面验收（设计 §4/§7.5/§10、§13 M1"公开面见 src/index.ts"）。
  *
  * 两条腿：
- * 1. **运行期值名不增不漏**：`Object.keys(import * as api)` 的精确集合（M2 增 `llmNode`）
+ * 1. **运行期值名不增不漏**：`Object.keys(import * as api)` 的精确集合（M2 增 `llmNode`、
+ *    M3 增 `agentNode`）
  *    ——多导（内部设施泄漏）或少导（调用方拿不到）都直接红；
- * 2. **公开类型名在类型位置可用**：22 个类型名各用一次（含一个走公开 API 的最小图；
- *    M2 增 `TokenUsage`/`CompleteFn`/`RunLogger`），名字缺失/改名时 `npm run typecheck`
+ * 2. **公开类型名在类型位置可用**：24 个类型名各用一次（含一个走公开 API 的最小图；
+ *    M2 增 `TokenUsage`/`CompleteFn`/`RunLogger`；M3 增 `AgentExecutor`/
+ *    `PiSubprocessConfig`），名字缺失/改名时 `npm run typecheck`
  *    失败——类型没有运行期痕迹，只能这样钉。
  *
  * 第三个用例把公开面**当包用**：只用 `src/index.js` 的导出构建并跑通一张图
@@ -54,9 +56,9 @@ import {
 type PublicState = { items: number[]; seen: number[] };
 
 describe("public surface: src/index.ts (设计 §10)", () => {
-	it("exports exactly the M1+M2 public value names — no leaks, no gaps", () => {
-		// 9 个错误类 + 图构建/执行 6 名（StateGraph/Send/START/END/fnNode/llmNode）+ 4 reducer
-		// + interpolate = 20 个运行期导出
+	it("exports exactly the M1+M2+M3 public value names — no leaks, no gaps", () => {
+		// 9 个错误类 + 图构建/执行 7 名（StateGraph/Send/START/END/fnNode/llmNode/agentNode）+ 4 reducer
+		// + interpolate = 21 个运行期导出
 		expect(Object.keys(api).sort()).toEqual([
 			"END",
 			"GraphRecursionError",
@@ -71,6 +73,7 @@ describe("public surface: src/index.ts (设计 §10)", () => {
 			"StateGraph",
 			"TemplateError",
 			"WorkflowError",
+			"agentNode",
 			"append",
 			"concat",
 			"fnNode",
