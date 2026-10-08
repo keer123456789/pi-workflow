@@ -1,0 +1,13 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    // TS 7（TS5011）要求显式 rootDir：include 只 ["src"] 时公共源目录即 ./src，
+    // 显式钉住保证产物布局 dist/index.js + dist/runtime/index.js（不出 dist/src/ 前缀）。
+    "rootDir": "src",
+    "declaration": true,
+    "declarationMap": false,
+    "noEmit": false
+  },
+  "include": ["src"]
+}

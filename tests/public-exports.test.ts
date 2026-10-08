@@ -12,6 +12,11 @@
  *
  * 第三个用例把公开面**当包用**：只用 `src/index.js` 的导出构建并跑通一张图
  * （Send 扇出 + append 合并 + 错误类实例判定），确认导出之间彼此自洽。
+ *
+ * M5 T1 增 `./runtime` 子入口断言组（D33 barrel）：`Object.keys(runtimeApi)` 精确
+ * 集合（2 个可用性探测值）+ 5 个 runtime 公开类型名在类型位置逐一引用——
+ * "." 入口的现有断言零改动。类型引用走 `runtimeApi.Xxx` 限定名，避免与上面
+ * "../src/index.js" 的类型导入撞名。
  */
 
 import { describe, expect, it } from "vitest";
@@ -53,6 +58,8 @@ import {
 	StateGraph,
 	WorkflowError,
 } from "../src/index.js";
+// —— M5 T1：./runtime 子入口（D33 barrel）——
+import * as runtimeApi from "../src/runtime/index.js";
 
 type PublicState = { items: number[]; seen: number[] };
 
@@ -299,5 +306,59 @@ describe("public surface: src/index.ts (设计 §10)", () => {
 		expect(failure).toBeInstanceOf(RouterError);
 		expect(failure).toBeInstanceOf(WorkflowError);
 		expect((failure as RouterError).result).toBe("nope");
+	});
+});
+
+describe("public surface: src/runtime/index.ts (./runtime 子入口, M5 T1/D33)", () => {
+	it("exports exactly the runtime entry value names — no leaks, no gaps", () => {
+		// 两个可用性探测值：isPiAiAvailable（llm-pi-ai.ts）/ isPiSdkAvailable（pi-sdk.ts）
+		expect(Object.keys(runtimeApi).sort()).toEqual([
+			"isPiAiAvailable",
+			"isPiSdkAvailable",
+		]);
+		// 适配器本体与内部设施不进子入口（D33：createPiSubprocessExecutor /
+		// createPiSdkExecutor 维持内部导出不进 barrel；探针/用量映射/默认补全同口径抽查）
+		for (const internal of [
+			"buildSpawnArgs",
+			"createPiSdkExecutor",
+			"createPiSubprocessExecutor",
+			"defaultPiAiComplete",
+			"probePeerPackage",
+			"resetPiCliProbeForTests",
+			"resetPiSdkCacheForTests",
+			"toTokenUsage",
+		]) {
+			expect(internal in runtimeApi).toBe(false);
+		}
+	});
+
+	it("exports the 5 runtime public type names at type position (compile-time check)", async () => {
+		// —— D33 的 5 个公开类型名各在类型位置真实使用一次（限定名 runtimeApi.Xxx）；
+		//    缺名/改名的代价是 typecheck 失败——类型没有运行期痕迹，只能这样钉 ——
+		const usage: runtimeApi.TokenUsage = {
+			input: 1,
+			output: 2,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 3,
+		};
+		const complete: runtimeApi.CompleteFn = async (req) => ({
+			text: req.prompt,
+			usage,
+		});
+		// 最小合法形状：req 由 handler 层构造（D20/D22），executor 只消费并回产出
+		const executor: runtimeApi.AgentExecutor = async (req) => ({
+			output: req.task,
+			usage,
+		});
+		// 字段全可选——空对象 {} 合法（M3/M4 裁定：compile 期只校验配置存在）
+		const subCfg: runtimeApi.PiSubprocessConfig = {};
+		const sdkCfg: runtimeApi.PiSdkConfig = {};
+
+		// 引用同时避免 unused 告警（运行期值只是类型 pin 的载体）
+		expect(typeof complete).toBe("function");
+		expect(typeof executor).toBe("function");
+		expect(subCfg).toEqual({});
+		expect(sdkCfg).toEqual({});
 	});
 });
