@@ -946,9 +946,10 @@ describe("compile: llm completion resolution (§6.6/D12, Task 8)", () => {
 // ---------------------------------------------------------------------------
 // M3/T2：compile 期 agent executor 解析与绑定（§4.6/D20）
 //
-// 解析是同步纯查表（D20——compile 无探测/无 spawn；版本探测归 Task 3 适配器，D18）。
-// 此刻只有自定义函数可绑定："subprocess" 的 spawn 适配器 Task 3 在 resolveAgentExecutors
-// 接线（配置存在即合法，空对象 {} 合法）；"sdk" M4 前报错。
+// 解析是同步纯查表（D20——compile 无探测/无 spawn；版本探测归适配器，D18）。
+// "subprocess" 的 spawn 适配器在 resolveAgentExecutors 接线（配置存在即合法，空对象
+// {} 合法）；"sdk" 在 M4 前报占位 issue——M4/T3 已将该占位退役并接线（D20 演进），
+// sdk 分支的现行行为见下方 "M4/T3" 用例组（预裁定例外 1 的既有断言更新）。
 // ---------------------------------------------------------------------------
 
 /** agent 节点声明的产出 schema（数组——写往 State.log，与 state 形状一致）。 */
@@ -1019,12 +1020,12 @@ describe("compile: agent executor resolution (§4.6/D20, M3/T2)", () => {
 		);
 	});
 
-	it('reports executor "sdk" as not implemented until M4', () => {
+	it('reports executor "sdk" without services.agent.sdk (D20 evolution: M4/T3 retires the placeholder)', () => {
 		const error = captureIssues(() => agentGraph("sdk").compile());
 
 		expect(error.issues).toHaveLength(1);
 		expect(error.issues[0]).toBe(
-			'node "check" (kind "agent") declares executor "sdk" but the sdk adapter is not implemented until M4',
+			'node "check" (kind "agent") declares executor "sdk" but services.agent.sdk is not configured (an empty object {} is enough to accept defaults)',
 		);
 	});
 
@@ -1061,5 +1062,96 @@ describe("compile: agent executor resolution (§4.6/D20, M3/T2)", () => {
 		expect(calls[0].startsWith("check 3")).toBe(true);
 		expect(calls[0]).toContain("输出约束");
 		expect(state.log).toEqual(["agent"]);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// M4/T3："sdk" 分支接线（D20 演进）
+//
+// 可用性由 `vi.mock("../../src/runtime/pi-sdk.js")` 控制（文件级 mock：graph.ts 对
+// pi-sdk 的运行期 import 全部落进 fake——上方 llm-pi-ai mock 的同款姿态）。检查顺序
+// 冻结（计划 T3 Step 1）：**先配置后可用性**——services.agent.sdk 缺省 → "未配置"
+// issue（不探测）；配置在但 @earendil-works/pi-coding-agent 不可用 → "未安装" issue；
+// 两关都过 → createPiSdkExecutor(config) 放行绑定。compile 不调用 executor——mock 的
+// 可辨识假函数即可（真实执行路径归 tests/runtime/pi-sdk.test.ts 的 fake SDK）。
+// ---------------------------------------------------------------------------
+
+/** 假 pi-sdk 模块的状态（vi.hoisted：mock 工厂先于 import 执行，必须同层提前建好）。 */
+const piSdk = vi.hoisted(() => ({
+	available: true,
+	probes: 0,
+	createCalls: [] as unknown[],
+}));
+
+vi.mock("../../src/runtime/pi-sdk.js", () => ({
+	isPiSdkAvailable: () => {
+		piSdk.probes += 1;
+		return piSdk.available;
+	},
+	// 与真工厂同形：只闭包配置（记录调用供接线断言），不执行任何进程动作。
+	createPiSdkExecutor: (config: unknown) => {
+		piSdk.createCalls.push(config);
+		return async () => ({ output: "sdk-fake" });
+	},
+}));
+
+/** 单个 sdk agent 节点（writer → log）的最小合法图（节点名 = 计划 T3 消息模板的 "writer"）。 */
+function sdkAgentGraph(): StateGraph<State> {
+	return new StateGraph<State>()
+		.addNode(
+			"writer",
+			agentNode<State, "log">({
+				task: "check {count}",
+				schema: agentListSchema,
+				writeTo: "log",
+				executor: "sdk",
+			}),
+		)
+		.addEdge(START, "writer")
+		.addEdge("writer", END);
+}
+
+describe("compile: agent executor resolution — sdk branch (D20 evolution, M4/T3)", () => {
+	it('reports executor "sdk" without services.agent.sdk, without probing availability (config check is first)', () => {
+		piSdk.probes = 0;
+
+		const error = captureIssues(() => sdkAgentGraph().compile());
+
+		expect(error.issues).toHaveLength(1);
+		expect(error.issues[0]).toBe(
+			'node "writer" (kind "agent") declares executor "sdk" but services.agent.sdk is not configured (an empty object {} is enough to accept defaults)',
+		);
+		// 先配置后可用性（冻结顺序）：配置缺省即报，可用性探测一次都不发生。
+		expect(piSdk.probes).toBe(0);
+	});
+
+	it('accepts executor "sdk" with an empty {} config when the peer package is available (bound, never run)', () => {
+		piSdk.available = true;
+		piSdk.createCalls.length = 0;
+
+		const data = dataWithOptions(sdkAgentGraph(), {
+			services: { agent: { sdk: {} } },
+		});
+
+		// compile 过、无 issue（不 run）：接线以配置调用工厂（空对象 {} 原样透传），
+		// executor 只绑定不执行。
+		expect(piSdk.createCalls).toEqual([{}]);
+		expect(data.nodes.get("writer")?.kind).toBe("agent");
+	});
+
+	it('reports executor "sdk" when the peer package is unavailable although the config is present', () => {
+		piSdk.available = false;
+		try {
+			const error = captureIssues(() =>
+				sdkAgentGraph().compile({ services: { agent: { sdk: {} } } }),
+			);
+
+			expect(error.issues).toHaveLength(1);
+			expect(error.issues[0]).toBe(
+				'node "writer" (kind "agent") declares executor "sdk" but @earendil-works/pi-coding-agent is not installed — install it (npm i @earendil-works/pi-coding-agent) to use the sdk executor',
+			);
+		} finally {
+			piSdk.available = true; // 探测状态不跨用例泄漏（asUnavailable 同款纪律）
+		}
 	});
 });

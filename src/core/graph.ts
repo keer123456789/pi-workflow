@@ -16,8 +16,10 @@
  *   （bindLlmNode，Task 6）；三级全缺、非 llm 节点声明 `complete` 都是校验错误（全量收集）；
  * - compile 期解析 agent 节点的执行器（§4.6/D20，D12 的镜像）：`cfg.executor` 为函数
  *   → 原样绑定；`"subprocess"` → `services.agent.subprocess` 配置存在才合法（空对象
- *   `{}` 合法，resolveAgentExecutors 绑定 pi CLI subprocess 适配器）；`"sdk"` → M4 前
- *   报错；手工 agent 定义无从声明 executor → 报错（kind 即契约）。全量收集。
+ *   `{}` 合法，resolveAgentExecutors 绑定 pi CLI subprocess 适配器）；`"sdk"` →
+ *   `services.agent.sdk` 配置存在且 peer 包可用才合法（M4/T3 接线——先配置后可用性，
+ *   缺任一都报 issue；可用性探测 D28：同步、进程缓存、永不抛）；手工 agent 定义无从
+ *   声明 executor → 报错（kind 即契约）。全量收集。
  */
 
 import type { TSchema } from "typebox";
@@ -26,6 +28,7 @@ import { agentExecutorOf, bindAgentNode } from "../nodes/agent.js";
 import { bindLlmNode } from "../nodes/llm.js";
 import type { AgentExecutor, CompleteFn } from "../runtime/executor.js";
 import { defaultPiAiComplete, isPiAiAvailable } from "../runtime/llm-pi-ai.js";
+import { createPiSdkExecutor, isPiSdkAvailable } from "../runtime/pi-sdk.js";
 import { createPiSubprocessExecutor } from "../runtime/pi-subprocess.js";
 import { executeRun, resolveServices } from "./engine.js";
 import { GraphSealedError, GraphValidationError } from "./errors.js";
@@ -127,7 +130,8 @@ export class StateGraph<S extends object> {
 		// （探测/取默认实现在每次 compile 里只发生一次，见 resolveLlmCompletions）。
 		const completions = resolveLlmCompletions(this.nodes, opts?.services);
 		// §4.6/D20：agent executor 解析与 llm 补全解析同旁——collectIssues 与 nodes
-		// 绑定共用同一份结果（同步纯查表，无探测/无 spawn，D18）。
+		// 绑定共用同一份结果（同步纯查表，无探测/无 spawn，D18；"sdk" 的可用性探测在
+		// collectIssues——同步、进程缓存、永不抛，D28）。
 		const agentExecutors = resolveAgentExecutors(this.nodes, opts?.services);
 		// 全量校验：一次报完，绝不 fail-fast（设计 §6）。
 		const issues = this.collectIssues(completions, opts?.services);
@@ -212,8 +216,8 @@ export class StateGraph<S extends object> {
 	 * compile 期错误（设计 §6.1/§6.2/§6.5/§6.6）：全量收集，顺序即报错顺序。
 	 * `completions` 是 llm 节点的补全解析结果（compile 在调用前算好，见
 	 * resolveLlmCompletions）——表里没有该节点的名字 = 三级解析全缺。
-	 * `services` 供 agent 分支读 `services.agent.subprocess` 配置存在性（D20：
-	 * `executor: "subprocess"` 的合法条件；空对象 `{}` 合法）。
+	 * `services` 供 agent 分支读 `services.agent.subprocess` / `services.agent.sdk`
+	 * 配置存在性（D20：`executor: "subprocess"` / `"sdk"` 的合法条件；空对象 `{}` 合法）。
 	 */
 	private collectIssues(
 		completions: ReadonlyMap<string, CompleteFn>,
@@ -327,9 +331,11 @@ export class StateGraph<S extends object> {
 		// 的运行期爆炸提前到 compile（§9.4：未注入 complete 且 pi-ai 不可用 → compile 报错）。
 		// §4.6/D20：agent 节点的 executor 同姿态——声明经 agentExecutorOf 读 WeakMap
 		// （executor 引用不是 NodeDefinition 字段）：工厂产物总能查到；手工 agent 定义
-		// 无从声明 → "has no executor implementation"（kind 即契约）；"sdk" M4 前未实现；
-		// "subprocess" 需 `services.agent.subprocess` 已配置（空对象 `{}` 合法——字段全有
-		// 默认）。配置在的 subprocess 节点此处放行（真实绑定在 resolveAgentExecutors）。
+		// 无从声明 → "has no executor implementation"（kind 即契约）；"subprocess" 需
+		// `services.agent.subprocess` 已配置（空对象 `{}` 合法——字段全有默认）；"sdk"
+		// 需 `services.agent.sdk` 已配置**且** peer 包可用（M4/T3——先配置后可用性：
+		// 配置缺省即报、不探测，配置在才调 isPiSdkAvailable，D28：同步、进程缓存、
+		// 永不抛）。两关都过的节点此处放行（真实绑定在 resolveAgentExecutors）。
 		for (const [name, def] of this.nodes) {
 			if (def.kind === "llm") {
 				if (!completions.has(name)) {
@@ -346,9 +352,17 @@ export class StateGraph<S extends object> {
 						`node "${name}" (kind "agent") has no executor implementation: pass executor: "subprocess" with services.agent.subprocess configured, or a custom AgentExecutor function to agentNode`,
 					);
 				} else if (declared === "sdk") {
-					issues.push(
-						`node "${name}" (kind "agent") declares executor "sdk" but the sdk adapter is not implemented until M4`,
-					);
+					// 检查顺序冻结（M4 计划 T3 Step 1）：先配置后可用性——配置缺省即报，
+					// 不触发可用性探测；配置在才查 peer 包（D28：同步、进程缓存、永不抛）。
+					if (services?.agent?.sdk === undefined) {
+						issues.push(
+							`node "${name}" (kind "agent") declares executor "sdk" but services.agent.sdk is not configured (an empty object {} is enough to accept defaults)`,
+						);
+					} else if (!isPiSdkAvailable()) {
+						issues.push(
+							`node "${name}" (kind "agent") declares executor "sdk" but @earendil-works/pi-coding-agent is not installed — install it (npm i @earendil-works/pi-coding-agent) to use the sdk executor`,
+						);
+					}
 				} else if (
 					declared === "subprocess" &&
 					services?.agent?.subprocess === undefined
@@ -468,9 +482,11 @@ function resolveLlmCompletions<S extends object>(
  * 适配器内首次真正调用时才做）。按声明形态分派（经 agentExecutorOf 读 WeakMap）：
  * - 自定义函数 → 原样入表（不需要任何 services 配置，compile 期即可绑定）；
  * - `"subprocess"` → `services.agent.subprocess` 配置在（空对象 `{}` 合法）→ 绑定
- *   `createPiSubprocessExecutor(config)`（T3 接线——工厂只闭包配置，无任何进程动作）；
+ *   `createPiSubprocessExecutor(config)`（M3 接线——工厂只闭包配置，无任何进程动作）；
  *   配置缺由 collectIssues 报；
- * - `"sdk"` → M4 才实现，collectIssues 报 issue。
+ * - `"sdk"` → `services.agent.sdk` 配置在（空对象 `{}` 合法）→ 绑定
+ *   `createPiSdkExecutor(config)`（M4/T3 接线——同款只闭包配置）；配置缺/peer 不可用
+ *   由 collectIssues 报（先配置后可用性，D28 探测在那边发生）。
  * 非工厂产物（查不到声明）不入表——collectIssues 报 "has no executor implementation"。
  */
 function resolveAgentExecutors<S extends object>(
@@ -490,6 +506,8 @@ function resolveAgentExecutors<S extends object>(
 			services?.agent?.subprocess !== undefined
 		) {
 			resolved.set(name, createPiSubprocessExecutor(services.agent.subprocess));
+		} else if (declared === "sdk" && services?.agent?.sdk !== undefined) {
+			resolved.set(name, createPiSdkExecutor(services.agent.sdk));
 		}
 	}
 	return resolved;
