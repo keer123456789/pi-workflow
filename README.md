@@ -18,6 +18,7 @@ npm install @wangchengshi/pi-workflow
   - Graphs made of `fn` nodes (or with injected services) need neither.
 - Advanced: probe peer availability before `compile()` via the `./runtime` subpath —
   `import { isPiAiAvailable, isPiSdkAvailable } from "@wangchengshi/pi-workflow/runtime"`.
+  Both are functions — call them (e.g. `isPiAiAvailable()`) to get a `boolean`.
 
 ## Quick start
 

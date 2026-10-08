@@ -77,7 +77,7 @@ npm notice
 - 版本号显示 `0.1.0`，标签 **Public**（不是 Pro/private）；
 - README 正常渲染（Quick start 代码块、表格都在）；
 - 右侧 **Repository** 链接指向 GitHub 仓库（若还没 push，见 §7——push 后此链接才真正可点）；
-- **Explore files** 里只有 `dist/`、`README.md` 与 `package.json`——`src/`、`tests/`、`docs/`、`examples/` 不在包里（`files` 白名单，D31）；
+- **Explore files** 里只有 `dist/`、`README.md`、`LICENSE` 与 `package.json`——`src/`、`tests/`、`docs/`、`examples/` 不在包里（`files` 白名单，D31；LICENSE 不在白名单里，是 npm 对 LICENSE/README/package.json 的自动包含特例）；
 - `npm install @wangchengshi/pi-workflow` 在任意临时目录装得上、import 得动（附录 B 的冒烟命令）。
 
 ## 6. 后续版本迭代
@@ -147,7 +147,7 @@ npm pack
 # 生成 wangchengshi-pi-workflow-0.1.0.tgz（自动触发 prepack → 重建 dist）
 ```
 
-核对 tarball 结构（`dist/` 与 `README.md` 在，`src/`、`tests/`、`docs/`、`examples/` 不在）：
+核对 tarball 结构（`dist/`、`README.md`、`LICENSE` 在，`src/`、`tests/`、`docs/`、`examples/` 不在）：
 
 ```bash
 tar -tf wangchengshi-pi-workflow-0.1.0.tgz
@@ -161,6 +161,6 @@ npm init -y
 npm install <仓库绝对路径>/wangchengshi-pi-workflow-0.1.0.tgz
 node -e "import('@wangchengshi/pi-workflow').then(m => console.log(typeof m.StateGraph, typeof m.fnNode))"
 # 预期输出：function function
-node -e "import('@wangchengshi/pi-workflow/runtime').then(m => console.log(m.isPiAiAvailable, m.isPiSdkAvailable))"
+node -e "import('@wangchengshi/pi-workflow/runtime').then(m => console.log(m.isPiAiAvailable(), m.isPiSdkAvailable()))"
 # 预期输出：true true（在本仓库 devDependencies 装了对等包的环境里）或 false false（干净环境）——两者都是合法值，关键是 import 不抛
 ```

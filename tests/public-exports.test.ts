@@ -14,7 +14,7 @@
  * （Send 扇出 + append 合并 + 错误类实例判定），确认导出之间彼此自洽。
  *
  * M5 T1 增 `./runtime` 子入口断言组（D33 barrel）：`Object.keys(runtimeApi)` 精确
- * 集合（2 个可用性探测值）+ 5 个 runtime 公开类型名在类型位置逐一引用——
+ * 集合（2 个可用性探测函数）+ 5 个 runtime 公开类型名在类型位置逐一引用——
  * "." 入口的现有断言零改动。类型引用走 `runtimeApi.Xxx` 限定名，避免与上面
  * "../src/index.js" 的类型导入撞名。
  */
@@ -311,7 +311,7 @@ describe("public surface: src/index.ts (设计 §10)", () => {
 
 describe("public surface: src/runtime/index.ts (./runtime 子入口, M5 T1/D33)", () => {
 	it("exports exactly the runtime entry value names — no leaks, no gaps", () => {
-		// 两个可用性探测值：isPiAiAvailable（llm-pi-ai.ts）/ isPiSdkAvailable（pi-sdk.ts）
+		// 两个可用性探测函数：isPiAiAvailable（llm-pi-ai.ts）/ isPiSdkAvailable（pi-sdk.ts）
 		expect(Object.keys(runtimeApi).sort()).toEqual([
 			"isPiAiAvailable",
 			"isPiSdkAvailable",
