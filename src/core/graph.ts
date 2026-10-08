@@ -16,7 +16,7 @@
  *   （bindLlmNode，Task 6）；三级全缺、非 llm 节点声明 `complete` 都是校验错误（全量收集）；
  * - compile 期解析 agent 节点的执行器（§4.6/D20，D12 的镜像）：`cfg.executor` 为函数
  *   → 原样绑定；`"subprocess"` → `services.agent.subprocess` 配置存在才合法（空对象
- *   `{}` 合法，spawn 适配器由 Task 3 在 resolveAgentExecutors 接线）；`"sdk"` → M4 前
+ *   `{}` 合法，resolveAgentExecutors 绑定 pi CLI subprocess 适配器）；`"sdk"` → M4 前
  *   报错；手工 agent 定义无从声明 executor → 报错（kind 即契约）。全量收集。
  */
 
@@ -26,6 +26,7 @@ import { agentExecutorOf, bindAgentNode } from "../nodes/agent.js";
 import { bindLlmNode } from "../nodes/llm.js";
 import type { AgentExecutor, CompleteFn } from "../runtime/executor.js";
 import { defaultPiAiComplete, isPiAiAvailable } from "../runtime/llm-pi-ai.js";
+import { createPiSubprocessExecutor } from "../runtime/pi-subprocess.js";
 import { executeRun, resolveServices } from "./engine.js";
 import { GraphSealedError, GraphValidationError } from "./errors.js";
 import { type StateSchema, stateKeyUniverse } from "./state.js";
@@ -328,8 +329,7 @@ export class StateGraph<S extends object> {
 		// （executor 引用不是 NodeDefinition 字段）：工厂产物总能查到；手工 agent 定义
 		// 无从声明 → "has no executor implementation"（kind 即契约）；"sdk" M4 前未实现；
 		// "subprocess" 需 `services.agent.subprocess` 已配置（空对象 `{}` 合法——字段全有
-		// 默认）。配置在的 subprocess 节点此处放行（spawn 适配器 Task 3 才接线，见
-		// resolveAgentExecutors）。
+		// 默认）。配置在的 subprocess 节点此处放行（真实绑定在 resolveAgentExecutors）。
 		for (const [name, def] of this.nodes) {
 			if (def.kind === "llm") {
 				if (!completions.has(name)) {
@@ -464,18 +464,17 @@ function resolveLlmCompletions<S extends object>(
 
 /**
  * agent executor 解析（§4.6/D20，resolveLlmCompletions 的镜像）：返回"节点名 → 生效的
- * 执行器"。**同步纯查表**（D20：compile 不探测、不 spawn——D18 的版本探测归 Task 3
- * 的适配器，首次真正调用时才做）。按声明形态分派（经 agentExecutorOf 读 WeakMap）：
+ * 执行器"。**同步无 I/O**（D18：compile 不探测、不 spawn——subprocess 的版本探测在
+ * 适配器内首次真正调用时才做）。按声明形态分派（经 agentExecutorOf 读 WeakMap）：
  * - 自定义函数 → 原样入表（不需要任何 services 配置，compile 期即可绑定）；
- * - `"subprocess"` → 配置在（空对象 `{}` 合法）= 合法但**本任务无可绑定函数**——
- *   spawn 适配器归 Task 3（`createPiSubprocessExecutor(services.agent.subprocess)`
- *   届时在此接线），节点 handler 暂保持未绑定占位；配置缺由 collectIssues 报；
+ * - `"subprocess"` → `services.agent.subprocess` 配置在（空对象 `{}` 合法）→ 绑定
+ *   `createPiSubprocessExecutor(config)`（T3 接线——工厂只闭包配置，无任何进程动作）；
+ *   配置缺由 collectIssues 报；
  * - `"sdk"` → M4 才实现，collectIssues 报 issue。
  * 非工厂产物（查不到声明）不入表——collectIssues 报 "has no executor implementation"。
  */
 function resolveAgentExecutors<S extends object>(
 	nodes: Map<string, NodeDefinition<S, unknown>>,
-	// biome-ignore lint/correctness/noUnusedFunctionParameters: 签名按计划 Task 2 Step 4 verbatim——services 是 Task 3 在此接线 createPiSubprocessExecutor(services.agent.subprocess) 的入参位；本任务同步解析（无探测/无 spawn，D18），只消费自定义函数，subprocess 配置存在性校验在 collectIssues。
 	services: Services | undefined,
 ): Map<string, AgentExecutor> {
 	const resolved = new Map<string, AgentExecutor>();
@@ -486,6 +485,11 @@ function resolveAgentExecutors<S extends object>(
 		const declared = agentExecutorOf(def);
 		if (typeof declared === "function") {
 			resolved.set(name, declared);
+		} else if (
+			declared === "subprocess" &&
+			services?.agent?.subprocess !== undefined
+		) {
+			resolved.set(name, createPiSubprocessExecutor(services.agent.subprocess));
 		}
 	}
 	return resolved;
