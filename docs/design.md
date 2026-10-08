@@ -528,7 +528,7 @@ core 只认识这两个接口。`executor: "subprocess" | "sdk"` 是语法糖，
 
 ### 9.3 sdk 适配器（M4）
 
-- 进程内 `import { ... } from "@earendil-works/pi-coding-agent"`，每个 agent 节点创建独立会话，结束即弃；
+- 进程内动态加载 `import("@earendil-works/pi-coding-agent")`（optional peer，缺失不致命），每个 agent 节点创建独立会话，结束即弃；
 - 取消/超时走会话 abort；输出与 schema 处理与 subprocess 相同；
 - **M4 裁定（D24）**：成败判定与 subprocess 的 verdictOf **逐类同构**——`prompt()` resolve 后取 `session.messages` 中最后一个 assistant 消息按 `stopReason` 判定：`"stop"` 成功（`content` 中 text 块 join `"\n"` + usage）；`"error"` 抛 `pi agent failed: <errorMessage>`（原文保留，D3 可匹配）；`"aborted"` 抛 `AbortError`；其他值可读失败不猜；`req.schema` 忽略（D22：schema 在 handler 层，适配器回原文）；
 - **M4 裁定（D25）**：每节点 `SessionManager.inMemory()` 新会话（不落 session 文件，对齐 CLI `--no-session`），`finally { session.dispose() }` 成功/失败/abort 全路径必达；不做会话复用（§14 开放问题 4 就此关闭）；
