@@ -29,7 +29,8 @@
  *   算杀，不等进程消亡）、POSIX `process.kill(-pid, "SIGKILL")` 组杀；signal 已
  *   abort 则不 spawn；**先杀后 reject**，快速失败——被放弃的子进程树不得存活；
  * - **usage 映射（D21/M0 ④.3）**：五计数 + `cost` 仅源有才带；数字键缺失以 0 填；
- *   pi 独有的 `cacheWrite1h` 等不转发；usage 对象整体缺失 → 结果不带 usage 字段；
+ *   pi 独有的 `cacheWrite1h` 等不转发；usage 对象整体缺失 → 结果不带 usage 字段
+ *   （实现抽到共享 `usage.ts`——M4/T1 逐字平移，与 pi sdk 适配器共用，D29）；
  * - **版本探测（D18/M0 ①）**：首次真正调用 executor 时惰性 spawn `pi --version`
  *   （同 config 的 bin/cwd/env；stdin "ignore"），stdout 去空白须为裸 semver 且满足
  *   `^1.0.4`；失败/超区间 → 可行动错误（含实测值、期望区间与 npm 安装提示）。结果
@@ -42,6 +43,7 @@ import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { execFile, spawn } from "node:child_process";
 
 import type { AgentExecutor, TokenUsage } from "./executor.js";
+import { toTokenUsage } from "./usage.js";
 
 /**
  * subprocess 适配器的启动配置（设计 §4.6 verbatim）：字段全可选——空对象 `{}` 即
@@ -125,7 +127,7 @@ function killTree(child: ChildProcess): void {
 }
 
 // ---------------------------------------------------------------------------
-// 事件流解析（M0 ④）与 usage 映射（D21）
+// 事件流解析（M0 ④）——usage 映射（D21）已抽到共享 usage.ts（M4/T1）
 // ---------------------------------------------------------------------------
 
 /** 适配器真正消费的 assistant `message_end` 字段（其余按协议原样忽略）。 */
@@ -232,38 +234,6 @@ function createEventStreamParser(): {
 		},
 		result: () => last,
 	};
-}
-
-/** 数字键缺失/非有限数值以 0 填（D21：pi 的 usage 键集可变，M0 ④.3）。 */
-function countOf(record: Record<string, unknown>, key: string): number {
-	const value = record[key];
-	return typeof value === "number" && Number.isFinite(value) ? value : 0;
-}
-
-/**
- * usage 映射（D21）：只带 D4 的五个计数；`cost` **只在源 usage 有 cost 时**进结果；
- * pi 独有的 `cacheWrite1h`/`raw*`/`reasoning` 不转发；usage 对象整体缺失 → 调用方
- * 不带 usage 字段（由 {@link verdictOf} 的存在性判断负责）。
- */
-function toTokenUsage(raw: Record<string, unknown>): TokenUsage {
-	const mapped: TokenUsage = {
-		input: countOf(raw, "input"),
-		output: countOf(raw, "output"),
-		cacheRead: countOf(raw, "cacheRead"),
-		cacheWrite: countOf(raw, "cacheWrite"),
-		totalTokens: countOf(raw, "totalTokens"),
-	};
-	const cost = raw.cost;
-	if (typeof cost === "object" && cost !== null) {
-		mapped.cost = {
-			input: countOf(cost as Record<string, unknown>, "input"),
-			output: countOf(cost as Record<string, unknown>, "output"),
-			cacheRead: countOf(cost as Record<string, unknown>, "cacheRead"),
-			cacheWrite: countOf(cost as Record<string, unknown>, "cacheWrite"),
-			total: countOf(cost as Record<string, unknown>, "total"),
-		};
-	}
-	return mapped;
 }
 
 // ---------------------------------------------------------------------------

@@ -2,8 +2,9 @@
  * pi-ai 默认补全适配器（D13；设计 §9.4、§9.1）。
  *
  * `src/runtime/` 是适配器的**物理隔离区**：本文件是 `@earendil-works/*` 的唯一接触点，
- * 且运行期**只动态 import**（静态面只有 `node:module` 的 `createRequire`）——对等依赖
- * 没装时本模块照常加载，`isPiAiAvailable()` 说"没有"，编译期给出可行动报错（Task 8）。
+ * 且运行期**只动态 import**（对等依赖的可用性探测经共享的 `./peer-resolve.js` 按名
+ * 解析，M4/T1 起不再直接持有 `node:module`）——对等依赖没装时本模块照常加载，
+ * `isPiAiAvailable()` 说"没有"，编译期给出可行动报错（Task 8）。
  * 类型层面用 `import(...)` 类型查询（编译期擦除，零运行期耦合）。
  *
  * 公开面（两个）：
@@ -29,9 +30,8 @@
  * 高级用户直接接线用。
  */
 
-import { createRequire } from "node:module";
-
 import type { CompleteFn, TokenUsage } from "./executor.js";
+import { probePeerPackage } from "./peer-resolve.js";
 
 /** 对等依赖包名（只按名解析/动态加载，从不静态 import）。 */
 const PI_AI_PACKAGE = "@earendil-works/pi-ai";
@@ -49,36 +49,12 @@ export function isPiAiAvailable(): boolean {
 }
 
 /**
- * 真实探测：`createRequire(import.meta.url).resolve(PKG)`（D13 指定机制）在 try/catch 里；
- * 它失败时退到 `import.meta.resolve(PKG)`。
- *
- * 为什么要退一步（对 pi-ai@1.0.4 实测）：其 `exports` map 的 `"."` 只声明了
- * `"types"`/`"import"` 两个条件——**没有 `"require"`/`"default"`**，而 `require.resolve`
- * 按 CJS 条件解析，必然 `ERR_PACKAGE_PATH_NOT_EXPORTED`：只按字面实现会让探测在
- * "装好了"时也报 false，默认实现永远接不上。`import.meta.resolve` 走 ESM 条件，正是
- * 本库（ESM-only）该用的机制；本仓库 Node ≥22，它在 22/24 与 vitest 下都可用。
+ * 真实探测（M4/T1 起为薄委托）：两步机制（`createRequire(import.meta.url).resolve`
+ * 失败退 `import.meta.resolve`，缘由与逐字实现见 {@link probePeerPackage}）抽到共享
+ * `./peer-resolve.js`，本适配器按名传入——**行为逐字不变**。
  */
 function probePiAi(): boolean {
-	try {
-		createRequire(import.meta.url).resolve(PI_AI_PACKAGE);
-		return true;
-	} catch {
-		// 落到 ESM 条件兜底（见上）；老环境/打包器里 import.meta.resolve 可能没有 → false。
-	}
-	try {
-		// 返回值按 `unknown` 收：打包器/自定义 loader 的 shim 可能返回 Promise 之类的
-		// 非字符串——`!== undefined` 会把它们误判成"可用"；只认字符串（判定不看其 settle）。
-		const resolve = (
-			import.meta as ImportMeta & {
-				resolve?: (specifier: string) => unknown;
-			}
-		).resolve;
-		return typeof resolve === "function"
-			? typeof resolve(PI_AI_PACKAGE) === "string"
-			: false;
-	} catch {
-		return false;
-	}
+	return probePeerPackage(PI_AI_PACKAGE);
 }
 
 /** 懒建单例（D13：重复调用返回**同一个** `CompleteFn` 实例）。 */

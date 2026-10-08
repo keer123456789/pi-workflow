@@ -5,9 +5,9 @@
  * 1. **运行期值名不增不漏**：`Object.keys(import * as api)` 的精确集合（M2 增 `llmNode`、
  *    M3 增 `agentNode`）
  *    ——多导（内部设施泄漏）或少导（调用方拿不到）都直接红；
- * 2. **公开类型名在类型位置可用**：24 个类型名各用一次（含一个走公开 API 的最小图；
+ * 2. **公开类型名在类型位置可用**：25 个类型名各用一次（含一个走公开 API 的最小图；
  *    M2 增 `TokenUsage`/`CompleteFn`/`RunLogger`；M3 增 `AgentExecutor`/
- *    `PiSubprocessConfig`），名字缺失/改名时 `npm run typecheck`
+ *    `PiSubprocessConfig`；M4 增 `PiSdkConfig`），名字缺失/改名时 `npm run typecheck`
  *    失败——类型没有运行期痕迹，只能这样钉。
  *
  * 第三个用例把公开面**当包用**：只用 `src/index.js` 的导出构建并跑通一张图
@@ -26,6 +26,7 @@ import type {
 	NodeContext,
 	NodeDefinition,
 	NodeHandler,
+	PiSdkConfig,
 	PiSubprocessConfig,
 	Reducer,
 	ResolvedServices,
@@ -129,6 +130,10 @@ describe("public surface: src/index.ts (设计 §10)", () => {
 		const executor: AgentExecutor = async (req) => ({ output: req.task });
 		// 字段全可选——空对象 {} 合法（D20：compile 期只校验配置存在）
 		const subCfg: PiSubprocessConfig = {};
+
+		// —— M4 新公开类型名（§4.6/§9.3 PiSdkConfig）——
+		// 字段全可选（D25/D27：agentDir/cwd/defaultModel 各有缺省），空对象 {} 合法
+		const sdkCfg: PiSdkConfig = {};
 
 		// —— 每一个公开类型名都被真实使用一次；缺名/改名的代价是 typecheck 失败 ——
 		const channels: StateSchema<PublicState> = { seen: append };
@@ -237,9 +242,10 @@ describe("public surface: src/index.ts (设计 §10)", () => {
 		expect(services.complete).toBe(complete);
 		expect(services.logger).toBe(runLogger);
 		expect(llmDefinition.complete).toBe(complete);
-		// M3 类型引用同时避免 unused 告警（运行期值只是类型 pin 的载体）
+		// M3/M4 类型引用同时避免 unused 告警（运行期值只是类型 pin 的载体）
 		expect(typeof executor).toBe("function");
 		expect(subCfg).toEqual({});
+		expect(sdkCfg).toEqual({});
 		expect(finishedWithUsage.type).toBe("node_finished");
 		expect(resolved.clock()).toBe(0);
 		expect(reducer([1], [2])).toEqual([1, 2]);
