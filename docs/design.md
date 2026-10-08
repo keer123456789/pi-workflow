@@ -311,7 +311,11 @@ type PiSubprocessConfig = {
   extraArgs?: string[];
   defaultModel?: string;
 };
-type PiSdkConfig = { defaultModel?: string; /* M4 细化 */ };
+type PiSdkConfig = {
+  agentDir?: string;        // pi agent 目录（auth.json/models.json 所在）。缺省 = pi 默认（PI_CODING_AGENT_DIR 或 ~/.pi/agent）
+  cwd?: string;             // 会话工作目录（资源发现与内置工具路径）。缺省 = process.cwd()
+  defaultModel?: string;    // 节点未声明 model 时的兜底模型串 "<provider>/<id>"（D23：cfg.model ?? defaultModel）
+};
 ```
 
 节点声明 `executor: "subprocess"` 但 `services.agent.subprocess` 未配置 → **compile 期报错**（依赖缺失尽早暴露）。`executor` 也可直接传自定义 `AgentExecutor` 函数。
