@@ -31,11 +31,17 @@ import {
 	type RunEvent,
 	type RunOptions,
 	type RunResult,
+	type SleepResult,
 	START,
 } from "../../src/core/types.js";
+import { agentNode } from "../../src/nodes/agent.js";
 import { fnNode } from "../../src/nodes/fn.js";
 import { llmNode } from "../../src/nodes/llm.js";
-import type { CompleteFn, TokenUsage } from "../../src/runtime/executor.js";
+import type {
+	AgentExecutor,
+	CompleteFn,
+	TokenUsage,
+} from "../../src/runtime/executor.js";
 
 /** 任务 brief 的 `g.run(...)` 简写：编译（无参）后跑一次。 */
 function run<S extends object>(
@@ -743,6 +749,110 @@ describe("engine: llm node end-to-end (Task 8, §4.3/§6.6)", () => {
 			output: ["draft"],
 		});
 		// D11：complete 报的 usage 经 ctx.reportUsage 挂上成功的 node_finished
+		expect(finished[0].usage).toEqual(usage);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// M3/T2：agent 节点端到端——compile 期绑定自定义 executor（D20），handler 层做
+// task 插值 + schema 指令/解析/校验（D22），引擎负责 writeTo 包装（§5.1:354）、
+// node_finished.usage（D21）与重试预算（§7.2）。
+// ---------------------------------------------------------------------------
+
+describe("engine: agent node end-to-end (M3/T2, D20/D22)", () => {
+	/** 与引擎 defaultSleep 同形（真实 setTimeout + 非枚举 cancel）——上面用例内注释。 */
+	function realCancelableSleep(ms: number): SleepResult {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const promise = new Promise<void>((resolve) => {
+			timer = setTimeout(resolve, ms);
+		});
+		Object.defineProperty(promise, "cancel", {
+			value: () => {
+				if (timer !== undefined) {
+					clearTimeout(timer);
+				}
+			},
+		});
+		return promise as SleepResult;
+	}
+
+	it("runs an agent node bound via a custom executor: interpolation, schema instruction, writeTo wrapping, usage on node_finished, retry budget", async () => {
+		type AgentState = {
+			clause: string;
+			verdict: { risk: string; score: number } | null;
+		};
+		const events: RunEvent[] = [];
+		const calls: Parameters<AgentExecutor>[0][] = [];
+		const usage: TokenUsage = {
+			input: 7,
+			output: 3,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 10,
+		};
+		let attempts = 0;
+		const executor: AgentExecutor = async (req) => {
+			calls.push(req);
+			attempts += 1;
+			if (attempts === 1) {
+				throw new Error("429 too many requests"); // D3 可重试
+			}
+			return {
+				output: '```json\n{"risk":"low","score":2}\n```',
+				usage,
+			};
+		};
+
+		const g = new StateGraph<AgentState>()
+			.addNode(
+				"check",
+				agentNode<AgentState, "verdict">({
+					task: "核查 {clause}",
+					schema: Type.Object({ risk: Type.String(), score: Type.Number() }),
+					writeTo: "verdict",
+					retry: { maxAttempts: 2 },
+					executor,
+				}),
+			)
+			.addEdge(START, "check")
+			.addEdge("check", END);
+
+		// 注入与引擎 defaultSleep 同形的**可取消真实 sleep**：agent 节点有 timeoutMs
+		//（缺省 600s），raceAttempt 用同一 sleep 武装尝试超时（§7.3）——立即 resolve 的
+		// 假 sleep 会把预算瞬间烧成"超时"。真实定时器下：退避等待 500 * 2^0 * 0.5 =
+		// 250ms（random 钉 0.5），600s 的尝试超时定时器在竞速分出胜负后被 cancelSleep
+		// 清掉（R20），不悬挂。
+		const compiled = g.compile({
+			services: { sleep: realCancelableSleep, random: () => 0.5 },
+		});
+		const { state } = await compiled.run(
+			{ clause: "c1", verdict: null },
+			{ onEvent: (event) => events.push(event) },
+		);
+
+		// retry:{maxAttempts:2} 生效：第一次 429 重试，第二次成功。
+		expect(calls).toHaveLength(2);
+		expect(calls[0].task.startsWith("核查 c1")).toBe(true); // 插值在前
+		expect(calls[0].task).toContain("输出约束"); // schema 指令拼在插值之后（D22）
+		expect(calls[1].task).toBe(calls[0].task); // D3：同 task 重发
+		expect(calls[1].runId).toBe(calls[0].runId);
+
+		// writeTo 落解析值本身（包裹是引擎 updateOf 的事）。
+		expect(state.verdict).toEqual({ risk: "low", score: 2 });
+
+		expect(ofType(events, "node_started")[0]).toMatchObject({
+			node: "check",
+			kind: "agent",
+		});
+		expect(ofType(events, "node_retry")).toHaveLength(1);
+		const finished = ofType(events, "node_finished");
+		expect(finished).toHaveLength(1);
+		expect(finished[0]).toMatchObject({
+			node: "check",
+			instanceId: "check#1",
+			output: { risk: "low", score: 2 },
+		});
+		// D21：成功尝试的 usage 挂 node_finished（失败尝试的不残留）。
 		expect(finished[0].usage).toEqual(usage);
 	});
 });

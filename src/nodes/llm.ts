@@ -19,7 +19,8 @@
  * `prompt 求值 → complete(...) → 剥 ```json 栅栏 → JSON.parse → Value.Check(schema)`；
  * JSON / schema 违规 `markRetryable(throw)`（D3：可重试、同 prompt 重发）；成功时
  * 先 `ctx.reportUsage(usage)`（仅 complete 报了 usage 才调，D11），再返回**解析值本身**
- * ——`{ [writeTo]: 值 }` 的包裹由引擎 `updateOf` 完成（§5.1:354）。
+ * ——`{ [writeTo]: 值 }` 的包裹由引擎 `updateOf` 完成（§5.1:354）。剥栅栏/解析/校验
+ * 助手在 `output-parse.ts`（M3/T2 平移共用，agent 节点同一套；llm 的错误消息逐字不变）。
  *
  * 注意（§5.6）：string prompt 含字面 JSON 花括号（如 `Return {"answer": …}`）会被当作
  * 模板插值并抛**不可重试**的 `TemplateError`——字面花括号必须转义为 `{{` / `}}`。
@@ -39,15 +40,10 @@ import type {
 } from "../core/types.js";
 import type { CompleteFn } from "../runtime/executor.js";
 import { interpolate } from "../template.js";
+import { parseJsonOutput, schemaErrorDetail } from "./output-parse.js";
 
 /** 单次尝试的默认超时（设计 §4.3）。 */
 const DEFAULT_TIMEOUT_MS = 120_000;
-
-/** schema 失败消息最多列出的错误条数（compact：不把几十条 issue 灌进 message）。 */
-const MAX_SCHEMA_ISSUES = 3;
-
-/** JSON 失败消息里原文预览的上限（字符）。 */
-const MAX_TEXT_PREVIEW = 200;
 
 /** 绑定所需的最小配置：与公开 cfg 的差异只在 `timeoutMs` 已归一。 */
 type LlmCfg = {
@@ -149,7 +145,7 @@ function createHandler<S, I>(
 			signal: ctx.signal,
 			timeoutMs: cfg.timeoutMs,
 		});
-		const parsed = parseCompletion(completion.text);
+		const parsed = parseJsonOutput("llm", completion.text);
 		if (!Value.Check(cfg.schema, parsed)) {
 			throw markRetryable(
 				new Error(
@@ -163,73 +159,4 @@ function createHandler<S, I>(
 		// writeTo 的包裹是引擎的事（§5.1:354 / engine.ts 的 updateOf）：返回解析值本身。
 		return parsed as Partial<S>;
 	};
-}
-
-/**
- * 解析补全文本（§4.3）：trim → 剥 ```json / ``` 栅栏 → `JSON.parse`。
- * 失败 → `markRetryable`（D3：llm 的 JSON 违规同 prompt 重发），消息带解析失败原因
- * 与原文预览——重试事件 / run 日志里能看清模型吐了什么。
- */
-function parseCompletion(text: string): unknown {
-	const body = stripFences(text.trim());
-	try {
-		return JSON.parse(body);
-	} catch (error) {
-		const reason = error instanceof Error ? error.message : String(error);
-		throw markRetryable(
-			new Error(
-				`llm output is not valid JSON: ${reason}; text: ${preview(body)}`,
-			),
-		);
-	}
-}
-
-/** 开栅栏：三个反引号 + 可选 json 标签（可带水平空白 / 换行；大小写不敏感）。 */
-const OPEN_FENCE = /^```(?:json)?[ \t]*\r?\n?/i;
-
-/**
- * 剥掉一层代码栅栏：开头命中 {@link OPEN_FENCE} 时剥开栅栏，且此时结尾若是 ``` 再剥
- * 闭栅栏（没开栅栏就不动结尾——裸 JSON 字符串本身可能以 ``` 结尾）。其余内容原样。
- */
-function stripFences(text: string): string {
-	const open = OPEN_FENCE.exec(text);
-	if (open === null) {
-		return text;
-	}
-	const body = text.slice(open[0].length);
-	const trimmed = body.trimEnd();
-	return trimmed.endsWith("```") ? trimmed.slice(0, -3) : body;
-}
-
-/**
- * schema 违规的紧凑详情：`instancePath: message`（根路径省略前缀），最多
- * {@link MAX_SCHEMA_ISSUES} 条 + 余量计数。`Value.Errors` 空但 `Check` 为假
- * （自造 schema / refine 不报错）时给一句兜底，不让消息断在冒号后。
- */
-function schemaErrorDetail(schema: TSchema, value: unknown): string {
-	const issues: string[] = [];
-	let total = 0;
-	for (const issue of Value.Errors(schema, value)) {
-		total += 1;
-		if (issues.length < MAX_SCHEMA_ISSUES) {
-			issues.push(
-				issue.instancePath === ""
-					? issue.message
-					: `${issue.instancePath}: ${issue.message}`,
-			);
-		}
-	}
-	if (total === 0) {
-		return "value rejected by schema (no error details reported)";
-	}
-	const rest = total - issues.length;
-	return rest > 0 ? `${issues.join("; ")} (+${rest} more)` : issues.join("; ");
-}
-
-/** 原文预览：压成单行 + 截断——错误消息要能塞进一行日志。 */
-function preview(text: string): string {
-	const flat = text.replace(/\s+/g, " ");
-	return flat.length <= MAX_TEXT_PREVIEW
-		? flat
-		: `${flat.slice(0, MAX_TEXT_PREVIEW)}…`;
 }

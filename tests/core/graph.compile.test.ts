@@ -30,9 +30,10 @@ import {
 	type RunEvent,
 	START,
 } from "../../src/core/types.js";
+import { agentNode } from "../../src/nodes/agent.js";
 import { fnNode } from "../../src/nodes/fn.js";
 import { llmNode } from "../../src/nodes/llm.js";
-import type { CompleteFn } from "../../src/runtime/executor.js";
+import type { AgentExecutor, CompleteFn } from "../../src/runtime/executor.js";
 import { defaultPiAiComplete } from "../../src/runtime/llm-pi-ai.js";
 
 type State = { count: number; log: string[] };
@@ -104,9 +105,12 @@ describe("compile validation: aggregation (设计 §6 一次报完)", () => {
 		const error = captureIssues(() => graph.compile());
 
 		expect(error.message).toBe("graph invalid");
-		// 6 条问题：ghost 起点 / nowhere 终点 / phantom router 起点 /
-		// START 无出边 / sink 缺 writeTo / writer 的 writeTo 越界
-		expect(error.issues).toHaveLength(6);
+		// 7 条问题：ghost 起点 / nowhere 终点 / phantom router 起点 /
+		// START 无出边 / sink 缺 writeTo / writer 的 writeTo 越界 /
+		// writer（手工 agent 定义）无 executor 实现——M3/T2 D20：kind 即契约，
+		// executor 不是 NodeDefinition 字段，手写 agent 定义无从声明（既有用例的
+		// 计数断言随该冻结裁定同步，本任务报告已披露）。
+		expect(error.issues).toHaveLength(7);
 		const expected = [
 			'edge source "ghost" is not a registered node',
 			'edge target "nowhere" (from "orphan") is not a registered node',
@@ -114,6 +118,7 @@ describe("compile validation: aggregation (设计 §6 一次报完)", () => {
 			"START has no outgoing edge",
 			'node "sink" (kind "llm") must declare writeTo',
 			'node "writer" writeTo key "missing" is not in the state key universe',
+			'node "writer" (kind "agent") has no executor implementation',
 		];
 		for (const fragment of expected) {
 			expect(error.issues.some((issue) => issue.includes(fragment))).toBe(true);
@@ -308,10 +313,15 @@ describe("compile validation: writeTo (设计 §6.5)", () => {
 
 			const error = captureIssues(() => graph.compile());
 
-			expect(error.issues).toHaveLength(1);
+			// M3/T2（D20）：手工 agent 定义额外报 "has no executor implementation"
+			//（executor 不是 NodeDefinition 字段，手写定义无从声明）——llm 1 条、agent 2 条。
+			expect(error.issues).toHaveLength(kind === "agent" ? 2 : 1);
 			expect(error.issues[0]).toContain('"summary"');
 			expect(error.issues[0]).toContain(kind);
 			expect(error.issues[0]).toContain("writeTo");
+			if (kind === "agent") {
+				expect(error.issues[1]).toContain("has no executor implementation");
+			}
 		}
 	});
 
@@ -506,12 +516,17 @@ describe("compile warnings: unreachable nodes (设计 §6.2, R13)", () => {
 				writeTo: "log",
 			})
 			.addNode("gate", fnNode<State>(noop))
-			.addNode("precedent_check", {
-				kind: "agent",
-				name: "",
-				handler: noop,
-				writeTo: "log",
-			})
+			// M3/T2（D20）：手工 agent 定义在 compile 期报 "has no executor implementation"
+			//（kind 即契约）——fixture 改用 agentNode 工厂产物（自定义 executor 免配置），
+			// 本用例断言的 R13 语义（有 router 即放弃可达性检查）不变。
+			.addNode(
+				"precedent_check",
+				agentNode<State, "log">({
+					task: "precedent",
+					writeTo: "log",
+					executor: async () => ({ output: "[]" }),
+				}),
+			)
 			.addNode("aggregate", {
 				kind: "llm",
 				name: "",
@@ -925,5 +940,98 @@ describe("compile: llm completion resolution (§6.6/D12, Task 8)", () => {
 			instanceId: "draft#1",
 			output: ["pi-ai"],
 		});
+	});
+});
+
+// ---------------------------------------------------------------------------
+// M3/T2：compile 期 agent executor 解析与绑定（§4.6/D20）
+//
+// 解析是同步纯查表（D20——compile 无探测/无 spawn；版本探测归 Task 3 适配器，D18）。
+// 此刻只有自定义函数可绑定："subprocess" 的 spawn 适配器 Task 3 在 resolveAgentExecutors
+// 接线（配置存在即合法，空对象 {} 合法）；"sdk" M4 前报错。
+// ---------------------------------------------------------------------------
+
+/** agent 节点声明的产出 schema（数组——写往 State.log，与 state 形状一致）。 */
+const agentListSchema = Type.Array(Type.String());
+
+/** 单个 agent 节点（check → log）的最小合法图；executor 按用例给声明形态。 */
+function agentGraph(
+	executor: "subprocess" | "sdk" | AgentExecutor,
+): StateGraph<State> {
+	return new StateGraph<State>()
+		.addNode(
+			"check",
+			agentNode<State, "log">({
+				task: "check {count}",
+				schema: agentListSchema,
+				writeTo: "log",
+				executor,
+			}),
+		)
+		.addEdge(START, "check")
+		.addEdge("check", END);
+}
+
+describe("compile: agent executor resolution (§4.6/D20, M3/T2)", () => {
+	it("reports a hand-written agent definition (executor is not a NodeDefinition field, so there is no way to declare one)", () => {
+		const error = captureIssues(() =>
+			minimal()
+				.addNode("writer", {
+					kind: "agent",
+					name: "",
+					handler: noop,
+					writeTo: "log",
+				})
+				.compile(),
+		);
+
+		expect(error.issues).toHaveLength(1);
+		expect(error.issues[0]).toBe(
+			'node "writer" (kind "agent") has no executor implementation: pass executor: "subprocess" with services.agent.subprocess configured, or a custom AgentExecutor function to agentNode',
+		);
+	});
+
+	it('reports executor "sdk" as not implemented until M4', () => {
+		const error = captureIssues(() => agentGraph("sdk").compile());
+
+		expect(error.issues).toHaveLength(1);
+		expect(error.issues[0]).toBe(
+			'node "check" (kind "agent") declares executor "sdk" but the sdk adapter is not implemented until M4',
+		);
+	});
+
+	it('reports executor "subprocess" without services.agent.subprocess', () => {
+		const error = captureIssues(() => agentGraph("subprocess").compile());
+
+		expect(error.issues).toHaveLength(1);
+		expect(error.issues[0]).toBe(
+			'node "check" (kind "agent") declares executor "subprocess" but services.agent.subprocess is not configured (an empty object {} is enough to accept defaults)',
+		);
+	});
+
+	it('accepts executor "subprocess" with an empty {} config (every field defaults, D20)', () => {
+		// 空对象 {} 合法：compile 只校验配置存在（D18 同步、无探测）；handler 的真实
+		// 绑定（spawn 适配器）归 Task 3——本任务不跑它，只认 compile 通过且无 issue。
+		const data = dataWithOptions(agentGraph("subprocess"), {
+			services: { agent: { subprocess: {} } },
+		});
+
+		expect(data.nodes.get("check")?.kind).toBe("agent");
+	});
+
+	it("binds a custom executor function without any services config and runs it (D20)", async () => {
+		const calls: string[] = [];
+		const compiled = agentGraph(async (req) => {
+			calls.push(req.task);
+			return { output: '["agent"]' };
+		}).compile();
+
+		const { state } = await compiled.run({ count: 3, log: [] });
+
+		// task 插值 + schema 指令拼在插值之后（D22）；解析值经 writeTo 落 state。
+		expect(calls).toHaveLength(1);
+		expect(calls[0].startsWith("check 3")).toBe(true);
+		expect(calls[0]).toContain("输出约束");
+		expect(state.log).toEqual(["agent"]);
 	});
 });
