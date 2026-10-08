@@ -80,7 +80,11 @@ export function buildSpawnArgs(
 		"-p",
 		"--no-session",
 		...(model ? ["--model", model] : []),
-		...(req.tools ? ["--tools", req.tools.join(",")] : []),
+		// 空数组视同未配置（M3 最终评审裁定）：`--tools ""` 未经 M0 实测，宁缺勿滥——
+		// 不带 flag 即 pi 的默认工具集；只有非空数组才透传白名单。
+		...(req.tools && req.tools.length > 0
+			? ["--tools", req.tools.join(",")]
+			: []),
 		...(config.extraArgs ?? []),
 	];
 	const opts: SpawnOptions = {

@@ -35,6 +35,7 @@ import {
 } from "vitest";
 
 import { StateGraph } from "../../src/core/graph.js";
+import { isRetryableError } from "../../src/core/retry.js";
 import { END, START } from "../../src/core/types.js";
 import { agentNode } from "../../src/nodes/agent.js";
 import type { AgentExecutor } from "../../src/runtime/executor.js";
@@ -162,7 +163,7 @@ async function main() {
         role: "assistant",
         content: [],
         stopReason: "error",
-        errorMessage: '403 {"error":{"type":"forbidden","message":"Request not allowed"}}',
+        errorMessage: process.env.FAKE_PI_ERROR_MESSAGE || '403 {"error":{"type":"forbidden","message":"Request not allowed"}}',
       },
     });
     line({ type: "agent_settled" });
@@ -458,19 +459,6 @@ describe("buildSpawnArgs (frozen spawn template, M0 ②)", () => {
 		const absent = buildSpawnArgs({}, {});
 		expect(absent.args).toEqual(["--mode", "json", "-p", "--no-session"]);
 
-		// 冻结模板的 truthy 判定 verbatim：显式 `tools: []` 是作者显式给的白名单
-		// （→ `--tools ""` 空白名单），原样透传不猜；"不带该参数"专指**未声明**（D23，
-		// pi 才用默认全量 read/bash/edit/write）。
-		const empty = buildSpawnArgs({}, { tools: [] });
-		expect(empty.args).toEqual([
-			"--mode",
-			"json",
-			"-p",
-			"--no-session",
-			"--tools",
-			"",
-		]);
-
 		const one = buildSpawnArgs({}, { tools: ["read"] });
 		expect(one.args).toEqual([
 			"--mode",
@@ -480,6 +468,15 @@ describe("buildSpawnArgs (frozen spawn template, M0 ②)", () => {
 			"--tools",
 			"read",
 		]);
+	});
+
+	it("treats an empty tools array as not configured: no --tools flag (M3 final review ruling)", () => {
+		// 裁定口径（M3 最终评审，Minor）：空数组视同未配置——`--tools ""` 未经 M0 实测，
+		// 宁缺勿滥；不带 flag 即 pi 的默认工具集（与 tools 未声明同形）。
+		const { args } = buildSpawnArgs({}, { tools: [] });
+
+		expect(args).toEqual(["--mode", "json", "-p", "--no-session"]);
+		expect(args.includes("--tools")).toBe(false);
 	});
 });
 
@@ -667,6 +664,34 @@ describe("two-layer verdict (D16)", () => {
 		const error = (await rejectionOf(executor(agentRequest()))) as Error;
 
 		expect(error.message).toBe("pi agent produced no assistant message");
+	}, 30_000);
+
+	// M3 最终评审（Important）：适配器 × 引擎的**交叉契约钉**。适配器对 stopReason
+	// "error" 抛 `pi agent failed: <errorMessage>`（D16，原文保留）；引擎把 executor 的
+	// 抛值原样交给 isRetryableError 按 D3 正则族分类（engine.ts 重试分支）。此前两侧只有
+	// 间接证据（适配器测消息前缀形状、引擎测自定义 executor），交叉点无直接测试：瞬态
+	// 5xx 原文经前缀拼接后必须仍落 D3 族（现状已可重试，本用例是契约锁），非瞬态 403
+	// 不得被误判为可重试。
+	it("layer 2: 'error' with a transient upstream message stays retryable through the 'pi agent failed:' prefix (D3 cross-contract)", async () => {
+		const { executor } = executorFor("llm-error", {
+			FAKE_PI_ERROR_MESSAGE: "503 Service Unavailable",
+		});
+
+		const error = (await rejectionOf(executor(agentRequest()))) as Error;
+
+		expect(error.message).toBe("pi agent failed: 503 Service Unavailable");
+		expect(isRetryableError(error)).toBe(true);
+	}, 30_000);
+
+	it("layer 2: 'error' with a non-transient upstream message is not retryable (D3 cross-contract)", async () => {
+		const { executor } = executorFor("llm-error", {
+			FAKE_PI_ERROR_MESSAGE: "403 Forbidden",
+		});
+
+		const error = (await rejectionOf(executor(agentRequest()))) as Error;
+
+		expect(error.message).toBe("pi agent failed: 403 Forbidden");
+		expect(isRetryableError(error)).toBe(false);
 	}, 30_000);
 });
 
