@@ -61,7 +61,7 @@ Note that `run()` resolves to `{ state, runId }`, not the bare state — see
   `concat` (string concat), `setOnce` (a second write throws `InvalidWriteError`).
   Two instances writing the same reducerless key in one superstep is an error, not a
   silent overwrite.
-- **Routers** — `(state, lastUpdate) => target` evaluated once per node per superstep.
+- **Routers** — `(state, lastUpdate) => target` evaluated at most once per node per superstep.
   Returns a node name, `END`, a `Send`, an array of those, or `null`/`undefined`
   (treated as `END`). `lastUpdate` is what the source node wrote this superstep —
   use it in loops to fan out only over fresh data.

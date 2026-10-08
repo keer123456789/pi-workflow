@@ -95,15 +95,16 @@ import { Type as T, Value, type Static } from "typebox";
 // 注：typebox 1.3.36 实测根导出为 `Type`（非 `T`），`Value` 在 `typebox/value` 子路径——
 // 若上式报错，用：`import { Type as T, type Static } from "typebox"; import { Value } from "typebox/value";`
 
-const ClauseList = T.Object({ clauses: T.Array(T.Object({ id: T.String(), text: T.String() })) });
+const ClauseList = T.Array(T.Object({ id: T.String(), text: T.String() }));  // extract 产出：数组形态（append reducer 做数组拼接）
 const RiskReport = T.Object({ clauseId: T.String(), risks: T.Array(T.String()),
                               severity: T.Union([T.Literal("high"), T.Literal("medium"), T.Literal("low")]) });
+const RiskReportList = T.Array(RiskReport);  // review / precedent_check 产出：单元素数组（同 append 语义）
 
 type S = {
   path: string;
   contractText: string;
-  clauses: Static<typeof ClauseList>["clauses"];  // append
-  riskReports: Static<typeof RiskReport>[];       // append
+  clauses: Static<typeof ClauseList>;           // append
+  riskReports: Static<typeof RiskReportList>;   // append
   finalReport: string;
 };
 
@@ -111,8 +112,10 @@ const app = new StateGraph<S>({
     name: "contract-review",                       // 用于日志标识
     channels: { clauses: append, riskReports: append },
   })
-  .addNode("load_doc", fnNode<{ path: string }, string>(   // 输入类型 = 初始 state 的形状子集
+  .addNode("load_doc", fnNode<S>(                           // 真实签名 fnNode<S, I = S>：I 为实例输入类型，缺省 = S
     async (s, ctx) => ({ contractText: await readContract(s.path, ctx.signal) })))
+  .addEdge(START, "load_doc")
+  .addEdge("load_doc", "extract")
   .addNode("extract", llmNode({
     prompt: "从以下合同中抽取全部条款，输出 JSON：\n{contractText}",
     schema: ClauseList,
@@ -123,7 +126,7 @@ const app = new StateGraph<S>({
     s.clauses.map(c => new Send("review", { clause: c })))
   .addNode("review", llmNode({                     // 经 Send 进入，输入 = { clause }
     prompt: "审查条款 {clause} 的法律风险，输出 JSON",
-    schema: RiskReport,
+    schema: RiskReportList,
     writeTo: "riskReports",
     retry: { maxAttempts: 3 },
   }))
@@ -136,7 +139,7 @@ const app = new StateGraph<S>({
   })
   .addNode("precedent_check", agentNode({          // 经 Send 进入，输入 = { clause }
     task: "结合案卷材料核查条款 {clause} 的引用是否准确",
-    schema: RiskReport,
+    schema: RiskReportList,
     writeTo: "riskReports",
     tools: ["read", "grep"],
     executor: "subprocess",
@@ -146,6 +149,7 @@ const app = new StateGraph<S>({
   .addEdge("precedent_check", "aggregate")         // 同上，aggregate 只跑一次
   .addNode("aggregate", llmNode({
     prompt: "汇总以下风险报告，生成审查报告：\n{riskReports}",  // 非字符串值按 JSON.stringify 插值
+    schema: T.String(),                            // 产出 JSON 字符串本身，writeTo 原样成为 finalReport（last-value 覆盖）
     writeTo: "finalReport",
   }))
   .addEdge("aggregate", END)
@@ -163,7 +167,9 @@ const { state, runId } = await app.run(
 );
 ```
 
-执行轨迹对照：S0 `load_doc` → S1 `extract` → S2 K 个 `review` 实例（Send 不去重）→ S3 M 个 `precedent_check` + `gate`（普通触发去重）→ S4 `aggregate`（`gate` 字符串路由或 `precedent_check` 普通边，二者互斥，去重后恰好一次）。
+执行轨迹对照（examples/contract-review.ts @ 80bc3c4 mock 实测，三条款）：S1 `load_doc` → S2 `extract` → S3 3 个 `review` 实例（Send 不去重，一条款一实例）→ S4 `gate`（多实例普通触发去重，只跑一次）→ S5 1 个 `precedent_check`（仅高风险条款经 Send 进入）→ S6 `aggregate`（`precedent_check` 普通边，去重后恰好一次；`gate` 字符串路由直达 `aggregate` 与此互斥，无高风险时 aggregate 提前到 S5）。
+
+落地实现见 examples/contract-review.ts：mock 模式（默认）离线全流程验证；真实模式（PI_WORKFLOW_EXAMPLE_MOCK=0）仅经 compile 期接线验证、未对真实 pi 实跑。
 
 ### 4.2 构造器签名
 
@@ -624,7 +630,7 @@ pi-workflow/
 | M2 | llm 节点 + pi-ai 默认 complete + run 日志 | schema 校验与 maxAttempts 重试生效；run.jsonl 落盘且含 seq/superstep/committed 标记（committed = `superstep_committed`/`superstep_aborted` 边界事件，见 §8.1）—— **完成**（llmNode / JSONL 日志 / pi-ai 适配器见 src/nodes/llm.ts、src/log/runlog.ts、src/runtime/llm-pi-ai.ts） |
 | M3 | subprocess 适配器 | 真实 pi CLI 联调按 M0 协议通过；超时 taskkill、usage 统计、临时文件清理—— **完成**（agentNode / subprocess 适配器见 src/nodes/agent.ts、src/runtime/pi-subprocess.ts） |
 | M4 | sdk 适配器 | 进程内跑通 agent 节点；optional peer 生效—— **完成**（PiSdkConfig 类型 / pi sdk 适配器见 src/index.ts、src/runtime/pi-sdk.ts，`executor: "sdk"` 由 src/core/graph.ts 接线） |
-| M5 | README、合同审查完整示例、发布准备 | npm pack 可安装；示例开箱即跑；langgraph 黄金用例全绿 |
+| M5 | README、合同审查完整示例、发布准备 | npm pack 可安装；示例开箱即跑；langgraph 黄金用例全绿 —— **完成**（README 与发布指南见 README.md、docs/publishing.md；合同审查示例见 examples/contract-review.ts；langgraph 黄金用例见 tests/core/langgraph-differences.test.ts；包名 / exports / 发布就绪验证见 D30–D34） |
 
 依赖顺序：M0 与 M1 可并行 → M2 → M3/M4 可并行 → M5。
 
@@ -632,7 +638,7 @@ pi-workflow/
 
 ## 14. 开放问题
 
-1. **包名与 scope**：`pi-workflow` 未挂 scope（需查 npm 占用）；是否挂用户自己的 scope？——M5 前必须定；
+1. **包名与 scope**：`pi-workflow` 未挂 scope（需查 npm 占用）；是否挂用户自己的 scope？—— **已决：@wangchengshi/pi-workflow（D30）**：裸名 `pi-workflow` 已被 VSCode 插件占用（popododo0720 Pi Workflow），@earendil-works scope 属 pi 框架作者；
 2. **stdin 协议确认**：pi CLI 是否支持 stdin prompt（M0）；
 3. **日志脱敏粒度**：`logOutputs: "hash"` 是否够用，或需按 key 脱敏；
 4. **SDK 会话复用**：M4 时决定每节点新会话 vs 同类型复用（上下文污染与成本）—— **已决：每节点新会话（D25）**，复用不做；
