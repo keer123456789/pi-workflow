@@ -5,7 +5,8 @@
  * 工厂产出的只是**待绑定**的 agent 定义：真正的 handler 需要知道用哪个执行器
  * （`AgentExecutor`），而这一解析发生在 compile 期（D20：`cfg.executor` 为函数 →
  * 原样绑定；`"subprocess"` → services.agent.subprocess 配置存在才合法，spawn 适配器
- * 由 Task 3 在 graph.ts 接线；`"sdk"` → M4 前一律 compile issue）——所以工厂把配置
+ * 由 Task 3 在 graph.ts 接线；`"sdk"` → services.agent.sdk 配置存在才合法，SDK 适配器
+ * 由 graph.ts 接线）——所以工厂把配置
  * （task / schema / tools / model / executor / 归一后的 timeoutMs）存进本模块的
  * WeakMap，`bindAgentNode(def, executor)` 用它造出真正的 handler（graph.ts 在装配
  * `CompiledGraphData.nodes` 副本时调用，`agentExecutorOf` 供解析/校验读声明）。

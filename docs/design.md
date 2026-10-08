@@ -526,6 +526,9 @@ core 只认识这两个接口。`executor: "subprocess" | "sdk"` 是语法糖，
 
 - 进程内 `import { ... } from "@earendil-works/pi-coding-agent"`，每个 agent 节点创建独立会话，结束即弃；
 - 取消/超时走会话 abort；输出与 schema 处理与 subprocess 相同；
+- **M4 裁定（D24）**：成败判定与 subprocess 的 verdictOf **逐类同构**——`prompt()` resolve 后取 `session.messages` 中最后一个 assistant 消息按 `stopReason` 判定：`"stop"` 成功（`content` 中 text 块 join `"\n"` + usage）；`"error"` 抛 `pi agent failed: <errorMessage>`（原文保留，D3 可匹配）；`"aborted"` 抛 `AbortError`；其他值可读失败不猜；`req.schema` 忽略（D22：schema 在 handler 层，适配器回原文）；
+- **M4 裁定（D25）**：每节点 `SessionManager.inMemory()` 新会话（不落 session 文件，对齐 CLI `--no-session`），`finally { session.dispose() }` 成功/失败/abort 全路径必达；不做会话复用（§14 开放问题 4 就此关闭）；
+- **M4 裁定（D26）**：pi 内置 auto-retry（settings 默认开启，maxRetries 3）**不关闭、不配置**——与 subprocess 路径的 CLI 行为一致；引擎 D3 重试在 pi 内部重试耗尽后才生效，接受二者的**乘法效应**；引擎 `timeoutMs` 仍约束单次尝试总时长（abort 会打断 pi 内部重试）；
 - 代价：与 pi SDK 版本强耦合，作为 **optional peerDependency**。
 
 ### 9.4 llm 默认实现（M2）
@@ -616,7 +619,7 @@ pi-workflow/
 | M1 | core 引擎：图构建/校验/封印/超步/去重/seq/预算/信号层级/模板 | §12 的 core 测试与确定性测试全绿 —— **完成**（M1 核心引擎，公开面见 src/index.ts） |
 | M2 | llm 节点 + pi-ai 默认 complete + run 日志 | schema 校验与 maxAttempts 重试生效；run.jsonl 落盘且含 seq/superstep/committed 标记（committed = `superstep_committed`/`superstep_aborted` 边界事件，见 §8.1）—— **完成**（llmNode / JSONL 日志 / pi-ai 适配器见 src/nodes/llm.ts、src/log/runlog.ts、src/runtime/llm-pi-ai.ts） |
 | M3 | subprocess 适配器 | 真实 pi CLI 联调按 M0 协议通过；超时 taskkill、usage 统计、临时文件清理—— **完成**（agentNode / subprocess 适配器见 src/nodes/agent.ts、src/runtime/pi-subprocess.ts） |
-| M4 | sdk 适配器 | 进程内跑通 agent 节点；optional peer 生效 |
+| M4 | sdk 适配器 | 进程内跑通 agent 节点；optional peer 生效—— **完成**（PiSdkConfig 类型 / pi sdk 适配器见 src/index.ts、src/runtime/pi-sdk.ts，`executor: "sdk"` 由 src/core/graph.ts 接线） |
 | M5 | README、合同审查完整示例、发布准备 | npm pack 可安装；示例开箱即跑；langgraph 黄金用例全绿 |
 
 依赖顺序：M0 与 M1 可并行 → M2 → M3/M4 可并行 → M5。
@@ -628,7 +631,7 @@ pi-workflow/
 1. **包名与 scope**：`pi-workflow` 未挂 scope（需查 npm 占用）；是否挂用户自己的 scope？——M5 前必须定；
 2. **stdin 协议确认**：pi CLI 是否支持 stdin prompt（M0）；
 3. **日志脱敏粒度**：`logOutputs: "hash"` 是否够用，或需按 key 脱敏；
-4. **SDK 会话复用**：M4 时决定每节点新会话 vs 同类型复用（上下文污染与成本）；
+4. **SDK 会话复用**：M4 时决定每节点新会话 vs 同类型复用（上下文污染与成本）—— **已决：每节点新会话（D25）**，复用不做；
 5. **CPU 密集 fn 的 worker 池**：出现实际阻塞问题时引入（与 `concurrencyKey` 一并考虑）。
 
 ---
