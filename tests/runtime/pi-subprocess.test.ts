@@ -111,10 +111,18 @@ function usageFor() {
 }
 
 async function main() {
-  // --version 优先于场景（D18 探测走这条；版本可用 FAKE_PI_VERSION 覆盖）
+  // --version 优先于场景（D18 探测走这条；版本可用 FAKE_PI_VERSION 覆盖）。
+  // FAKE_PI_VERSION_DELAY（ms）> 0 时在计数后挂起再打印——探测窗口内 abort 的用例
+  // 靠它锁定"探测在飞"的时刻（R1）。
   if (process.argv.includes("--version")) {
     bumpCounter(process.env.FAKE_PI_PROBE_COUNTER);
-    write((process.env.FAKE_PI_VERSION || "1.0.4") + "\\n");
+    const print = () => write((process.env.FAKE_PI_VERSION || "1.0.4") + "\\n");
+    const delay = Number.parseInt(process.env.FAKE_PI_VERSION_DELAY || "0", 10);
+    if (delay > 0) {
+      setTimeout(print, delay);
+    } else {
+      print();
+    }
     return;
   }
 
@@ -212,6 +220,17 @@ async function main() {
     // 启动期错误（M0 ④.6 第二行）：stderr + 退出码 1——双层判定的第 1 层
     process.stderr.write('Error: Model "no-such-provider/no-such-model" not found.\\n');
     process.stderr.write("detail-" + "y".repeat(2000) + "\\n");
+    process.exitCode = 1;
+    return;
+  }
+
+  if (mode === "stderr-flood") {
+    // R1 回归锁：stderr > 8KB。头部在前 ~6 字节；"TAIL-MARKER-9KB" 从第 ~9007 字节
+    // 起——超出 8KB 收集上限。中间用空格填充：压缩单行会把空白折叠，若收集**无**
+    // 上限，"start TAIL-MARKER-9KB" 会整体落进 500 字符消息窗口，断言即可区分。
+    process.stderr.write("start ");
+    process.stderr.write(" ".repeat(9000));
+    process.stderr.write("TAIL-MARKER-9KB");
     process.exitCode = 1;
     return;
   }
@@ -501,6 +520,19 @@ describe("version probe (D18)", () => {
 			expect(second.message).toBe(first.message);
 			expect(await readCounter(probeCounter)).toBe(1);
 		}
+
+		// R1（评审 Minor 2）：observed 原文进消息前截 ~200 字符——病态 bin 把版本行
+		// 写成日志倾倒时错误消息仍有界；D18 冻结模板的形状不变（只截 got 的内容）。
+		resetPiCliProbeForTests();
+		const long = "x".repeat(300);
+		const longProbe = executorFor("success", { FAKE_PI_VERSION: long });
+		const longError = (await rejectionOf(
+			longProbe.executor(agentRequest()),
+		)) as Error;
+		expect(longError.message).toContain(`got ${long.slice(0, 200)}`);
+		// 300 个 x 没有全进消息（200 截断生效）；`x`.repeat(201) 同样不出现。
+		expect(longError.message.includes(long)).toBe(false);
+		expect(await readCounter(longProbe.probeCounter)).toBe(1);
 	}, 40_000);
 
 	it("caches the successful probe across executor calls (probe child spawned once)", async () => {
@@ -788,4 +820,77 @@ describe("graph wiring (executor 'subprocess')", () => {
 		// T2 只做到"compile 过"（无探测/无绑定）；T3 起此图真正可跑——产出经 writeTo 落 state。
 		expect(state.out).toBe("好的");
 	}, 40_000);
+});
+
+// ---------------------------------------------------------------------------
+// R1 回归锁（T3 评审 Minor 1）：预 abort 不 spawn / 探测期取消不缓存 / stderr 8KB 上限
+// ---------------------------------------------------------------------------
+
+describe("R1 regression locks (T3 review)", () => {
+	it("rejects an already-aborted signal before any spawn (no probe child, no main process)", async () => {
+		const { executor, probeCounter, echoFile } = executorFor("success");
+		const controller = new AbortController();
+		controller.abort(); // 先 abort 再调用（D19：signal 已 abort → 不 spawn）
+
+		const error = (await rejectionOf(
+			executor(agentRequest({ signal: controller.signal })),
+		)) as Error;
+
+		expect(error).toBeInstanceOf(Error);
+		expect(error.name).toBe("AbortError");
+		expect(error.message).toBe("pi agent aborted");
+		// 不 spawn 的证据：探测子进程从未拉起（计数文件不存在 → 0），
+		// 主进程也从未跑过（echo 文件从未写出）。
+		expect(await readCounter(probeCounter)).toBe(0);
+		await expect(readFile(echoFile, "utf8")).rejects.toThrow();
+	}, 30_000);
+
+	it("does not cache an abort landing inside the probe window (next call re-probes and succeeds)", async () => {
+		// 探测窗口：fake 的 --version 在计数后延迟 3s 才打印——abort 落在窗口内，
+		// 探测子进程被杀、探测以 "aborted" 收场。
+		const aborted = executorFor("success", { FAKE_PI_VERSION_DELAY: "3000" });
+		const controller = new AbortController();
+		const pending = aborted.executor(
+			agentRequest({ signal: controller.signal }),
+		);
+		let probed = 0;
+		const deadline = Date.now() + 5000;
+		while (probed === 0 && Date.now() < deadline) {
+			await sleep(25);
+			probed = await readCounter(aborted.probeCounter);
+		}
+		expect(probed).toBe(1); // 探测子进程已在窗口内（打印版本之前）
+
+		controller.abort();
+		const error = (await rejectionWithin(
+			pending,
+			5000,
+			"probe-window abort must fail fast",
+		)) as Error;
+		expect(error).toBeInstanceOf(Error);
+		expect(error.name).toBe("AbortError");
+
+		// 取消不是"pi 不可用"的证据——不缓存（实现裁定，R1 钉）：清缓存后下一次
+		// 调用**重新探测且成功**，自己的计数文件从 0 起算 = 1（若失败被缓存，
+		// 这里会直接复抛 "pi CLI is not usable" 且计数为 0）。
+		resetPiCliProbeForTests();
+		const fresh = executorFor("success");
+		const result = await fresh.executor(agentRequest());
+		expect(result.output).toBe("好的");
+		expect(await readCounter(fresh.probeCounter)).toBe(1);
+	}, 40_000);
+
+	it("caps collected stderr at 8KB — bytes beyond the cap never reach the failure message", async () => {
+		const { executor } = executorFor("stderr-flood");
+
+		const error = (await rejectionOf(executor(agentRequest()))) as Error;
+
+		expect(error.message.startsWith("pi CLI failed (exit 1): ")).toBe(true);
+		// 8KB 之前的头部幸存（压缩单行）。
+		expect(error.message).toContain("start");
+		// 第 ~9007 字节起的标记从未被收集。压缩会把中间 9000 个空格折叠成一个，
+		// 若收集无上限，"start TAIL-MARKER-9KB" 会整体落进 500 字符消息窗口——
+		// 此断言即失败。8KB 上限（Task 3 Step 3）由此可黑盒观测。
+		expect(error.message.includes("TAIL-MARKER-9KB")).toBe(false);
+	}, 30_000);
 });

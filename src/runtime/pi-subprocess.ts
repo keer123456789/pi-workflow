@@ -389,6 +389,10 @@ function satisfiesCaretRange(version: [number, number, number]): boolean {
 	return major === 1 && (minor > 0 || patch >= 4);
 }
 
+/** observed（实测 stdout 原文）进错误消息前的截断上限（R1 评审 Minor 2：病态 bin 把
+ * 版本行写成日志倾倒时，错误消息仍有界；D18 冻结模板的形状不变——只截 got 的内容）。 */
+const OBSERVED_MAX_CHARS = 200;
+
 /** D18 的可行动错误：含实测值、期望区间与两条可行动路线（装包 / 显式指 bin）。 */
 function probeNotUsableError(
 	observed: string,
@@ -398,7 +402,7 @@ function probeNotUsableError(
 ): Error {
 	const detail =
 		observed !== ""
-			? observed
+			? observed.slice(0, OBSERVED_MAX_CHARS)
 			: spawnError !== undefined
 				? `spawn failed: ${messageOf(spawnError)}`
 				: exitCode !== null && exitCode !== 0
@@ -435,16 +439,32 @@ function probeOnce(
 			env: { ...process.env, ...config.env },
 			detached: process.platform !== "win32",
 		});
-		let stdout = "";
-		let stderr = "";
-		child.stdout?.setEncoding("utf8");
-		child.stdout?.on("data", (chunk: string) => {
-			stdout += chunk;
+		// R1（评审 Minor 2）：探测侧 stdout/stderr 与主路径同机制——8KB 字节级截断，
+		// 病态 bin 把版本行写成日志倾倒时内存与错误消息仍有界。
+		const stdoutChunks: Buffer[] = [];
+		const stderrChunks: Buffer[] = [];
+		let stdoutBytes = 0;
+		let stderrBytes = 0;
+		child.stdout?.on("data", (chunk: Buffer) => {
+			if (stdoutBytes >= STDERR_MAX_BYTES) {
+				return;
+			}
+			const take = chunk.subarray(0, STDERR_MAX_BYTES - stdoutBytes);
+			stdoutChunks.push(take);
+			stdoutBytes += take.length;
 		});
-		child.stderr?.setEncoding("utf8");
-		child.stderr?.on("data", (chunk: string) => {
-			stderr += chunk;
+		child.stderr?.on("data", (chunk: Buffer) => {
+			if (stderrBytes >= STDERR_MAX_BYTES) {
+				return;
+			}
+			const take = chunk.subarray(0, STDERR_MAX_BYTES - stderrBytes);
+			stderrChunks.push(take);
+			stderrBytes += take.length;
 		});
+		const stdoutText = (): string =>
+			Buffer.concat(stdoutChunks).toString("utf8");
+		const stderrText = (): string =>
+			Buffer.concat(stderrChunks).toString("utf8");
 
 		let settled = false;
 		const settle = (outcome: ProbeOutcome): void => {
@@ -464,11 +484,11 @@ function probeOnce(
 		child.on("error", (error) => {
 			settle({
 				kind: "failed",
-				error: probeNotUsableError("", null, stderr, error),
+				error: probeNotUsableError("", null, stderrText(), error),
 			});
 		});
 		child.on("close", (code) => {
-			const observed = stdout.trim();
+			const observed = stdoutText().trim();
 			const version = parseSemver(observed);
 			if (code === 0 && version !== undefined && satisfiesCaretRange(version)) {
 				settle({ kind: "ok" });
@@ -476,7 +496,7 @@ function probeOnce(
 			}
 			settle({
 				kind: "failed",
-				error: probeNotUsableError(observed, code, stderr, undefined),
+				error: probeNotUsableError(observed, code, stderrText(), undefined),
 			});
 		});
 	});
