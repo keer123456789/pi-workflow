@@ -568,6 +568,38 @@ describe("cancellation (frozen flow ①④⑤⑥)", () => {
 		expect(error.message).toBe("pi sdk agent aborted");
 		expect(session.dispose).toHaveBeenCalledTimes(1);
 	});
+
+	// R1（评审 Minor 1）监听清理锁：冻结点⑤的"finally 移除监听"——调用完成（成功
+	// 路径）之后，同一 signal 再 abort 绝不能触达已 dispose 的旧 session。若实现
+	// 只挂监听不移除（once 只在**触发后**自摘，成功路径上根本不触发），这里的
+	// abort 会让残留监听对旧 session 调 abort——abort 计数即暴露泄漏。
+	it("removes the abort listener on completion: a later abort never reaches the disposed session (⑤ finally)", async () => {
+		const session = fakeSession([
+			{
+				role: "assistant",
+				content: [{ type: "text", text: "ok" }],
+				stopReason: "stop",
+			},
+		]);
+		wireSuccess(session);
+		const fresh = await freshPiSdk();
+		const controller = new AbortController();
+
+		await fresh.createPiSdkExecutor({})(
+			agentRequest({ signal: controller.signal }),
+		);
+
+		// 探针：证明 abort 事件确实在同一 signal 上发生（用例有效性前提）。
+		let probeFired = false;
+		controller.signal.addEventListener("abort", () => {
+			probeFired = true;
+		});
+		controller.abort();
+
+		expect(probeFired).toBe(true);
+		// 残留监听会对已 dispose 的旧 session 调 abort——计数必须不变。
+		expect(session.abort).not.toHaveBeenCalled();
+	});
 });
 
 // ---------------------------------------------------------------------------
@@ -806,5 +838,20 @@ describe("availability and loading (D28)", () => {
 			reimported.createPiSdkExecutor({})(agentRequest()),
 		)) as Error;
 		expect(third.message).toBe(error.message);
+	});
+
+	// R1（评审 Minor 2）双重置契约锁：`resetPiSdkCacheForTests` 同时清 available 与
+	// loading（D28），此前只有 resetModules 模式间接覆盖。本用例**不 resetModules**、
+	// 只调 reset：探测已发生（计数 N）→ reset → isPiSdkAvailable 再探（计数 N+1）。
+	it("resetPiSdkCacheForTests alone (no module reset) re-arms the availability cache (D28)", async () => {
+		mocks.probePeerPackage.mockReturnValue(true);
+		const fresh = await freshPiSdk();
+
+		expect(fresh.isPiSdkAvailable()).toBe(true);
+		expect(mocks.probePeerPackage).toHaveBeenCalledTimes(1); // N = 1
+
+		fresh.resetPiSdkCacheForTests();
+		expect(fresh.isPiSdkAvailable()).toBe(true);
+		expect(mocks.probePeerPackage).toHaveBeenCalledTimes(2); // N+1：探测重新发生
 	});
 });
