@@ -2,8 +2,9 @@
  * 适配层公共接口（设计 §9.1）：`CompleteFn`、`AgentExecutor` 与用量类型 `TokenUsage`。
  *
  * - `src/runtime/` 是适配器的**物理隔离区**：core/** 不 import `@earendil-works/*`，
- *   只对本文件做 **type-only import**（`import type` 编译期擦除——运行时零耦合）；
- * - pi-ai / subprocess / sdk 适配器**实现**属各里程碑的后续任务，本文件只承载接口类型。
+ *   对 runtime 模块一律 **type-only import**（`import type` 编译期擦除——运行时零耦合）；
+ * - pi-ai 默认补全已落地（`llm-pi-ai.ts`，M2）；subprocess / sdk 适配器实现属后续
+ *   里程碑，本文件只承载接口类型。
  */
 
 import type { TSchema } from "typebox";
