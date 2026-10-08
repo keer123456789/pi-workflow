@@ -14,6 +14,7 @@
 
 import { describe, expect, it } from "vitest";
 import type {
+	AgentExecutor,
 	ChannelUpdate,
 	CompiledGraph,
 	CompiledGraphData,
@@ -23,6 +24,7 @@ import type {
 	NodeContext,
 	NodeDefinition,
 	NodeHandler,
+	PiSubprocessConfig,
 	Reducer,
 	ResolvedServices,
 	Router,
@@ -118,6 +120,12 @@ describe("public surface: src/index.ts (设计 §10)", () => {
 				loggerCalls.push(`finish:${info.status}`);
 			},
 		};
+
+		// —— M3 两个新公开类型名（§9.1 AgentExecutor / §4.6 PiSubprocessConfig）——
+		// 最小合法形状：req 由 handler 层构造（D20/D22），executor 只消费并回产出
+		const executor: AgentExecutor = async (req) => ({ output: req.task });
+		// 字段全可选——空对象 {} 合法（D20：compile 期只校验配置存在）
+		const subCfg: PiSubprocessConfig = {};
 
 		// —— 每一个公开类型名都被真实使用一次；缺名/改名的代价是 typecheck 失败 ——
 		const channels: StateSchema<PublicState> = { seen: append };
@@ -226,6 +234,9 @@ describe("public surface: src/index.ts (设计 §10)", () => {
 		expect(services.complete).toBe(complete);
 		expect(services.logger).toBe(runLogger);
 		expect(llmDefinition.complete).toBe(complete);
+		// M3 类型引用同时避免 unused 告警（运行期值只是类型 pin 的载体）
+		expect(typeof executor).toBe("function");
+		expect(subCfg).toEqual({});
 		expect(finishedWithUsage.type).toBe("node_finished");
 		expect(resolved.clock()).toBe(0);
 		expect(reducer([1], [2])).toEqual([1, 2]);

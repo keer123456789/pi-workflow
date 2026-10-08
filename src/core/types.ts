@@ -9,6 +9,7 @@ import type { TSchema } from "typebox";
 
 import type { RunLogger } from "../log/runlog.js";
 import type { CompleteFn, TokenUsage } from "../runtime/executor.js";
+import type { PiSubprocessConfig } from "../runtime/pi-subprocess.js";
 import type { Send } from "./send.js";
 import type { StateSchema } from "./state.js";
 
@@ -119,8 +120,13 @@ export type CompiledGraphData<S> = {
 export type CompileOptions = { name?: string; services?: Services };
 
 export type Services = {
-	// biome-ignore lint/suspicious/noExplicitAny: 对外字段按任务 brief verbatim（M2/M3 才细化具体配置）
-	agent?: { subprocess?: any; sdk?: any };
+	/**
+	 * agent 节点的适配器配置（§4.6/D20）：`subprocess` 字段全可选——空对象 `{}` 即
+	 * 接受全部默认；`sdk` 适配器 M4 才实现（M3 内声明 `executor: "sdk"` 只产
+	 * compile issue），届时再细化其类型。
+	 */
+	// biome-ignore lint/suspicious/noExplicitAny: sdk 字段 M4 才细化（M3 内 "sdk" 只产 compile issue，D20）
+	agent?: { subprocess?: PiSubprocessConfig; sdk?: any };
 	/** llm 节点的默认补全实现（§4.6/D12）：缺省时 compile 用 pi-ai 适配器（§9.4）。 */
 	complete?: CompleteFn;
 	/**

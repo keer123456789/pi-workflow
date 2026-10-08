@@ -1,11 +1,13 @@
 /**
- * 包公开面（设计 §4/§7.5/§10）：M1 的全部公开 API 与公开类型 + M2 新增（llmNode 与三类型）。
+ * 包公开面（设计 §4/§7.5/§10）：M1 的全部公开 API 与公开类型 + M2 新增（llmNode 与三类型）
+ * + M3 新增类型（AgentExecutor / PiSubprocessConfig——值 `agentNode` 归 M3 收尾任务）。
  *
  * 口径是**不增不漏**——逐名列出，不多导一个、也不少导一个：
  * - 运行期值：StateGraph / Send / START / END / 节点工厂（fnNode / llmNode）、4 个标准
  *   reducer（overwrite/append/concat/setOnce）、9 个错误类、interpolate；
  * - 类型：前序任务 Interfaces 冻结的公开类型（NodeContext…SleepResult），一律 `export type`
- *   （只在类型位置存在，运行期无痕迹）；M2 增 `TokenUsage` / `CompleteFn` / `RunLogger`。
+ *   （只在类型位置存在，运行期无痕迹）；M2 增 `TokenUsage` / `CompleteFn` / `RunLogger`；
+ *   M3 增 `AgentExecutor` / `PiSubprocessConfig`。
  *
  * 内部设施**不进包面**：engine 的 executeRun/resolveServices、emitter、foldUpdates/
  * stateKeyUniverse、InstanceCancelledError 等都是实现细节（可自由重构，不构成契约）。
@@ -58,6 +60,13 @@ export { END, START } from "./core/types.js";
 export type { RunLogger } from "./log/runlog.js";
 export { fnNode } from "./nodes/fn.js";
 export { llmNode } from "./nodes/llm.js";
-export type { CompleteFn, TokenUsage } from "./runtime/executor.js";
+// —— M3 公开类型（设计 §4.6/§9.1）：agent 执行器接口与 pi subprocess 配置
+// （适配器实现归 M3 后续任务）——
+export type {
+	AgentExecutor,
+	CompleteFn,
+	TokenUsage,
+} from "./runtime/executor.js";
+export type { PiSubprocessConfig } from "./runtime/pi-subprocess.js";
 // —— 模板插值（设计 §5.6） ——
 export { interpolate } from "./template.js";
