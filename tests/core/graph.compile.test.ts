@@ -973,6 +973,34 @@ function agentGraph(
 }
 
 describe("compile: agent executor resolution (§4.6/D20, M3/T2)", () => {
+	it("reports a hand-written agent definition that declares complete (R1: falls through to the shared check, §4.3)", () => {
+		const { complete } = fakeComplete("[]");
+
+		const error = captureIssues(() =>
+			minimal()
+				.addNode("writer", {
+					kind: "agent",
+					name: "",
+					handler: noop,
+					writeTo: "log",
+					complete,
+				})
+				.compile(),
+		);
+
+		// 全量收集（§6）：手工 agent 定义无从声明 executor（D20），executor issue
+		// 照旧报；complete 声明再追加一条——两条同批，不互斥（R1 前 complete 被
+		// agent 分支的 continue 静默吞掉）。
+		expect(error.issues).toHaveLength(2);
+		expect(error.issues[0]).toContain(
+			'node "writer" (kind "agent") has no executor implementation',
+		);
+		// 消息逐字 = 既有 llm/fn 分支的同款模板（§4.3：complete 是 llm 专用）。
+		expect(error.issues[1]).toBe(
+			'node "writer" (kind "agent") must not declare complete: it is only supported on kind "llm" nodes',
+		);
+	});
+
 	it("reports a hand-written agent definition (executor is not a NodeDefinition field, so there is no way to declare one)", () => {
 		const error = captureIssues(() =>
 			minimal()

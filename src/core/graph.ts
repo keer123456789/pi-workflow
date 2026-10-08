@@ -357,7 +357,9 @@ export class StateGraph<S extends object> {
 						`node "${name}" (kind "agent") declares executor "subprocess" but services.agent.subprocess is not configured (an empty object {} is enough to accept defaults)`,
 					);
 				}
-				continue;
+				// 不 continue（T2 R1）：落入下方 complete 声明检查——complete 是 llm
+				// 专用（§4.3），agent 节点声明它同样报"must not declare complete"；
+				// executor issue 与 complete issue 全量同批收集（§6），不互斥。
 			}
 			if (def.complete !== undefined) {
 				issues.push(
